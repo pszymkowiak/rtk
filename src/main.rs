@@ -1,12 +1,17 @@
+mod container;
 mod deps;
+mod diff_cmd;
 mod env_cmd;
 mod filter;
+mod find_cmd;
 mod git;
 mod json_cmd;
 mod local_llm;
+mod log_cmd;
 mod ls;
 mod read;
 mod runner;
+mod summary;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -32,51 +37,32 @@ struct Cli {
 enum Commands {
     /// List directory contents in ultra-dense, token-optimized format
     Ls {
-        /// Path to list (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Maximum depth to traverse
         #[arg(short, long, default_value = "10")]
         depth: usize,
-
-        /// Show hidden files (except .git, node_modules, etc.)
         #[arg(short = 'a', long)]
         all: bool,
-
-        /// Output format: tree, flat, json
         #[arg(short, long, default_value = "tree")]
         format: ls::OutputFormat,
     },
 
     /// Read file with intelligent filtering
     Read {
-        /// File to read
         file: PathBuf,
-
-        /// Filter level: none, minimal, aggressive
         #[arg(short, long, default_value = "minimal")]
         level: filter::FilterLevel,
-
-        /// Maximum lines to output (smart truncation)
         #[arg(short, long)]
         max_lines: Option<usize>,
-
-        /// Show line numbers
         #[arg(short = 'n', long)]
         line_numbers: bool,
     },
 
-    /// Generate 2-line technical summary (heuristic-based, no LLM)
+    /// Generate 2-line technical summary (heuristic-based)
     Smart {
-        /// File to summarize
         file: PathBuf,
-
-        /// Model (ignored, kept for compatibility)
         #[arg(short, long, default_value = "heuristic")]
         model: String,
-
-        /// Force re-download (ignored)
         #[arg(long)]
         force_download: bool,
     },
@@ -89,102 +75,144 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
-        /// Command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 
     /// Run tests and show only failures
     Test {
-        /// Test command to run (e.g., "cargo test", "pytest", "npm test")
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 
     /// Show JSON structure without values
     Json {
-        /// JSON file to analyze
         file: PathBuf,
-
-        /// Maximum depth to show
         #[arg(short, long, default_value = "5")]
         depth: usize,
     },
 
     /// Summarize project dependencies
     Deps {
-        /// Project directory (defaults to current)
         #[arg(default_value = ".")]
         path: PathBuf,
     },
 
     /// Show environment variables (filtered, sensitive masked)
     Env {
-        /// Filter by name (case-insensitive)
         #[arg(short, long)]
         filter: Option<String>,
-
-        /// Show all values (including sensitive)
         #[arg(long)]
         show_all: bool,
+    },
+
+    /// Find files with compact tree output
+    Find {
+        /// Pattern to search (glob)
+        pattern: String,
+        /// Path to search in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Maximum results to show
+        #[arg(short, long, default_value = "50")]
+        max: usize,
+    },
+
+    /// Ultra-condensed diff (only changed lines)
+    Diff {
+        /// First file or - for stdin (unified diff)
+        file1: PathBuf,
+        /// Second file (optional if stdin)
+        file2: Option<PathBuf>,
+    },
+
+    /// Filter and deduplicate log output
+    Log {
+        /// Log file (omit for stdin)
+        file: Option<PathBuf>,
+    },
+
+    /// Docker commands with compact output
+    Docker {
+        #[command(subcommand)]
+        command: DockerCommands,
+    },
+
+    /// Kubectl commands with compact output
+    Kubectl {
+        #[command(subcommand)]
+        command: KubectlCommands,
+    },
+
+    /// Run command and show heuristic summary
+    Summary {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum GitCommands {
-    /// Compact diff output
     Diff {
-        /// Additional git diff arguments
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
-
-        /// Maximum lines to show
         #[arg(short, long)]
         max_lines: Option<usize>,
     },
-
-    /// Compact log output
     Log {
-        /// Additional git log arguments
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
-
-        /// Number of commits to show
         #[arg(short = 'n', long, default_value = "10")]
         count: usize,
     },
-
-    /// Compact status output
     Status,
+}
+
+#[derive(Subcommand)]
+enum DockerCommands {
+    /// List running containers
+    Ps,
+    /// List images
+    Images,
+    /// Show container logs (deduplicated)
+    Logs {
+        container: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KubectlCommands {
+    /// List pods
+    Pods {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// List services
+    Services {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Show pod logs (deduplicated)
+    Logs {
+        pod: String,
+        #[arg(short, long)]
+        container: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Ls {
-            path,
-            depth,
-            all,
-            format,
-        } => {
+        Commands::Ls { path, depth, all, format } => {
             ls::run(&path, depth, all, format, cli.verbose)?;
         }
 
-        Commands::Read {
-            file,
-            level,
-            max_lines,
-            line_numbers,
-        } => {
+        Commands::Read { file, level, max_lines, line_numbers } => {
             read::run(&file, level, max_lines, line_numbers, cli.verbose)?;
         }
 
-        Commands::Smart {
-            file,
-            model,
-            force_download,
-        } => {
+        Commands::Smart { file, model, force_download } => {
             local_llm::run(&file, &model, force_download, cli.verbose)?;
         }
 
@@ -220,6 +248,62 @@ fn main() -> Result<()> {
 
         Commands::Env { filter, show_all } => {
             env_cmd::run(filter.as_deref(), show_all, cli.verbose)?;
+        }
+
+        Commands::Find { pattern, path, max } => {
+            find_cmd::run(&pattern, &path, max, cli.verbose)?;
+        }
+
+        Commands::Diff { file1, file2 } => {
+            if let Some(f2) = file2 {
+                diff_cmd::run(&file1, &f2, cli.verbose)?;
+            } else {
+                diff_cmd::run_stdin(cli.verbose)?;
+            }
+        }
+
+        Commands::Log { file } => {
+            if let Some(f) = file {
+                log_cmd::run_file(&f, cli.verbose)?;
+            } else {
+                log_cmd::run_stdin(cli.verbose)?;
+            }
+        }
+
+        Commands::Docker { command } => match command {
+            DockerCommands::Ps => {
+                container::run(container::ContainerCmd::DockerPs, &[], cli.verbose)?;
+            }
+            DockerCommands::Images => {
+                container::run(container::ContainerCmd::DockerImages, &[], cli.verbose)?;
+            }
+            DockerCommands::Logs { container: c } => {
+                container::run(container::ContainerCmd::DockerLogs, &[c], cli.verbose)?;
+            }
+        },
+
+        Commands::Kubectl { command } => match command {
+            KubectlCommands::Pods { namespace } => {
+                let args: Vec<String> = namespace.map(|n| vec!["-n".to_string(), n]).unwrap_or_default();
+                container::run(container::ContainerCmd::KubectlPods, &args, cli.verbose)?;
+            }
+            KubectlCommands::Services { namespace } => {
+                let args: Vec<String> = namespace.map(|n| vec!["-n".to_string(), n]).unwrap_or_default();
+                container::run(container::ContainerCmd::KubectlServices, &args, cli.verbose)?;
+            }
+            KubectlCommands::Logs { pod, container: c } => {
+                let mut args = vec![pod];
+                if let Some(cont) = c {
+                    args.push("-c".to_string());
+                    args.push(cont);
+                }
+                container::run(container::ContainerCmd::KubectlLogs, &args, cli.verbose)?;
+            }
+        },
+
+        Commands::Summary { command } => {
+            let cmd = command.join(" ");
+            summary::run(&cmd, cli.verbose)?;
         }
     }
 
