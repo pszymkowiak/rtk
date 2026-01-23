@@ -5,6 +5,7 @@ mod env_cmd;
 mod filter;
 mod find_cmd;
 mod git;
+mod grep_cmd;
 mod init;
 mod json_cmd;
 mod local_llm;
@@ -149,6 +150,24 @@ enum Commands {
     Summary {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Compact grep - strips whitespace, truncates, groups by file
+    Grep {
+        /// Pattern to search
+        pattern: String,
+        /// Path to search in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Max line length
+        #[arg(short = 'l', long, default_value = "80")]
+        max_len: usize,
+        /// Max results to show
+        #[arg(short, long, default_value = "50")]
+        max: usize,
+        /// Show only match context (not full line)
+        #[arg(short, long)]
+        context_only: bool,
     },
 
     /// Initialize rtk instructions in CLAUDE.md
@@ -316,6 +335,10 @@ fn main() -> Result<()> {
         Commands::Summary { command } => {
             let cmd = command.join(" ");
             summary::run(&cmd, cli.verbose)?;
+        }
+
+        Commands::Grep { pattern, path, max_len, max, context_only } => {
+            grep_cmd::run(&pattern, &path, max_len, max, context_only, cli.verbose)?;
         }
 
         Commands::Init { global, show } => {
