@@ -356,19 +356,80 @@ fn flush_arg(tokens: &mut Vec<ParsedToken>, current: &mut String, offset: usize)
     }
 }
 
-/// True for constructs the permission gate can't decompose, so they must never
-/// be auto-allowed: command/process substitution, or a real file-target redirect
-/// (fd-dup like `2>&1` and `/dev/null` are exempt). Separators and subshells are
-/// handled by [`split_for_permissions`], not flagged here.
+/// True for constructs the permission gate can't safely interpret, so they must
+/// never be auto-allowed or rewritten. This includes command/process
+/// substitution, parenthesized shell syntax, control keywords at command
+/// boundaries, incomplete quoting, and real file-target redirects. FD duplication
+/// such as `2>&1` and redirects to `/dev/null` remain attestable.
 pub fn contains_unattestable_construct(cmd: &str) -> bool {
-    if contains_substitution(cmd) {
+    if contains_substitution(cmd) || has_unclosed_quote_or_escape(cmd) {
         return true;
     }
-    let tokens = tokenize(cmd);
+
+    // Conservative newline handling: a lone `\r` is a command boundary too, so a
+    // control keyword hidden behind one cannot slip past this gate.
+    let tokens = tokenize_inner(cmd, NewlineMode::Conservative);
+    if tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::Shellism && matches!(token.value.as_str(), "(" | ")"))
+        || contains_control_keyword_at_command_position(&tokens)
+    {
+        return true;
+    }
+
     tokens
         .iter()
         .enumerate()
         .any(|(i, tok)| tok.kind == TokenKind::Redirect && redirect_has_file_target(&tokens, i))
+}
+
+fn has_unclosed_quote_or_escape(cmd: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for character in cmd.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            match quote {
+                Some(open) if open == character => quote = None,
+                None => quote = Some(character),
+                _ => {}
+            }
+        }
+    }
+
+    quote.is_some() || escaped
+}
+
+fn contains_control_keyword_at_command_position(tokens: &[ParsedToken]) -> bool {
+    const CONTROL_KEYWORDS: &[&str] = &[
+        "and", "or", "not", "begin", "end", "if", "else", "switch", "case", "for", "while",
+        "function",
+    ];
+
+    let mut command_position = true;
+    for token in tokens {
+        match token.kind {
+            TokenKind::Operator | TokenKind::Pipe(_) => command_position = true,
+            TokenKind::Shellism if token.value == "&" => command_position = true,
+            TokenKind::Arg if command_position => {
+                if CONTROL_KEYWORDS.contains(&token.value.as_str()) {
+                    return true;
+                }
+                command_position = false;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 /// Quote-aware: bash runs backtick/`$(...)` unquoted and inside double quotes,
@@ -1372,6 +1433,25 @@ mod tests {
     }
 
     #[test]
+    fn test_unattestable_fish_command_substitution() {
+        assert!(contains_unattestable_construct("git status (printf x)"));
+    }
+
+    #[test]
+    fn test_unattestable_fish_control_keyword_at_command_position() {
+        assert!(contains_unattestable_construct("git status; and printf x"));
+        assert!(contains_unattestable_construct(
+            "if test -d src\ngit status\nend"
+        ));
+    }
+
+    #[test]
+    fn test_fish_keyword_as_argument_is_attestable() {
+        assert!(!contains_unattestable_construct("rg and src"));
+        assert!(!contains_unattestable_construct("printf '%s\\n' or"));
+    }
+
+    #[test]
     fn test_unattestable_substitution_inside_double_quotes() {
         assert!(contains_unattestable_construct(
             r#"git log --pretty="$(rm -rf ~)""#
@@ -1389,6 +1469,13 @@ mod tests {
         assert!(!contains_unattestable_construct("echo '$(rm -rf ~)'"));
         assert!(!contains_unattestable_construct("echo '`whoami`'"));
         assert!(!contains_unattestable_construct(r#"echo "\$(rm -rf ~)""#));
+        assert!(!contains_unattestable_construct("echo '(printf x)'"));
+    }
+
+    #[test]
+    fn test_unattestable_incomplete_quoting() {
+        assert!(contains_unattestable_construct("git status 'unfinished"));
+        assert!(contains_unattestable_construct("git status \\"));
     }
 
     #[test]
@@ -1423,10 +1510,8 @@ mod tests {
     }
 
     #[test]
-    fn test_attestable_subshell_and_separators() {
-        assert!(!contains_unattestable_construct(
-            "(git status; cargo build)"
-        ));
+    fn test_unattestable_subshell_but_attestable_separators() {
+        assert!(contains_unattestable_construct("(git status; cargo build)"));
         assert!(!contains_unattestable_construct(
             "git status && cargo build"
         ));
