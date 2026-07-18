@@ -225,6 +225,9 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -232,6 +235,9 @@ enum Commands {
 
     /// Run tests and show only failures
     Test {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -310,6 +316,9 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run and summarize
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -668,12 +677,20 @@ enum Commands {
         min_occurrences: usize,
     },
 
-    /// Execute a shell command via sh -c (raw, no filtering or tracking)
+    /// Execute argv directly, or a command string through an explicit shell
     Run {
-        /// Command string to execute (use -c for shell-like invocation)
-        #[arg(short = 'c', long = "command")]
+        /// Command string to execute through a shell
+        #[arg(short = 'c', long = "command", conflicts_with = "args")]
         command: Option<String>,
-        /// Positional command arguments (alternative to -c)
+        /// Shell used with -c (defaults to sh on Unix and cmd on Windows)
+        #[arg(
+            long,
+            value_name = "SHELL",
+            requires = "command",
+            conflicts_with = "args"
+        )]
+        shell: Option<String>,
+        /// Program and literal arguments for direct execution (alternative to -c)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -2032,14 +2049,14 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Err { command } => {
-            let cmd = command.join(" ");
-            runner::run_err(&cmd, cli.verbose)?
+        Commands::Err { shell, command } => {
+            runner::run_err(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run err command")?
         }
 
-        Commands::Test { command } => {
-            let cmd = command.join(" ");
-            runner::run_test(&cmd, cli.verbose)?
+        Commands::Test { shell, command } => {
+            runner::run_test(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run test command")?
         }
 
         Commands::Json {
@@ -2157,9 +2174,9 @@ fn run_cli() -> Result<i32> {
             OcCommands::Other(args) => container::run_oc_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { command } => {
-            let cmd = command.join(" ");
-            summary::run(&cmd, cli.verbose)?
+        Commands::Summary { shell, command } => {
+            summary::run(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run summary command")?
         }
 
         Commands::Grep {
@@ -2717,23 +2734,33 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Run { command, args } => {
-            let raw = match command {
-                Some(c) => c,
-                None if !args.is_empty() => args.join(" "),
-                None => String::new(),
-            };
-            if raw.trim().is_empty() {
+        Commands::Run {
+            command,
+            shell,
+            args,
+        } => {
+            if command
+                .as_deref()
+                .is_none_or(|script| script.trim().is_empty())
+                && args.is_empty()
+            {
                 0
             } else {
-                use std::process::Command as ProcCommand;
-                let shell = if cfg!(windows) { "cmd" } else { "sh" };
-                let flag = if cfg!(windows) { "/C" } else { "-c" };
-                let status = ProcCommand::new(shell)
-                    .arg(flag)
-                    .arg(&raw)
+                let (mut prepared, description) = match command {
+                    Some(script) => (
+                        core::shell::shell_command(&script, shell.as_deref())
+                            .context("Failed to prepare run shell command")?,
+                        format!("shell command: {script}"),
+                    ),
+                    None => (
+                        core::shell::direct_command(&args)
+                            .context("Failed to prepare direct run command")?,
+                        core::shell::display_args(&args),
+                    ),
+                };
+                let status = prepared
                     .status()
-                    .with_context(|| format!("Failed to execute: {}", raw))?;
+                    .with_context(|| format!("Failed to execute {description}"))?;
                 core::utils::exit_code_from_status(&status, "run")
             }
         }
@@ -3513,8 +3540,13 @@ mod tests {
     fn test_run_command_with_dash_c() {
         let cli = Cli::try_parse_from(["rtk", "run", "-c", "git status && echo done"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert_eq!(command, Some("git status && echo done".to_string()));
+                assert!(shell.is_none());
                 assert!(args.is_empty());
             }
             _ => panic!("Expected Run command"),
@@ -3525,8 +3557,13 @@ mod tests {
     fn test_run_command_positional_args() {
         let cli = Cli::try_parse_from(["rtk", "run", "echo", "hello"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert!(command.is_none());
+                assert!(shell.is_none());
                 assert_eq!(args, vec!["echo", "hello"]);
             }
             _ => panic!("Expected Run command"),
@@ -3542,6 +3579,29 @@ mod tests {
                 _ => panic!("Expected Ctest command"),
             }
         }
+    }
+
+    #[test]
+    fn test_run_command_with_explicit_shell() {
+        let cli =
+            Cli::try_parse_from(["rtk", "run", "--shell", "fish", "-c", "echo (pwd)"]).unwrap();
+        match cli.command {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
+                assert_eq!(command, Some("echo (pwd)".to_string()));
+                assert_eq!(shell, Some("fish".to_string()));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_shell_requires_command_string() {
+        assert!(Cli::try_parse_from(["rtk", "run", "--shell", "fish", "echo"]).is_err());
     }
 
     #[test]

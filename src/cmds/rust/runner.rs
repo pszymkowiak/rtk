@@ -1,34 +1,32 @@
-//! Shell-string wrappers over the shared err/test command runners in core.
+//! Argv and explicit-shell wrappers over the shared err/test command runners in core.
 
-use crate::core::runner::{run_err_cmd, run_test_cmd};
-use anyhow::Result;
-use std::process::Command;
+use crate::core::runner::{run_err_cmd, run_test_cmd, TestEcosystem};
+use crate::core::shell::{command_from_args, display_args};
+use anyhow::{Context, Result};
 
-fn build_shell_command(command: &str) -> Command {
-    if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    }
+/// Run a command and filter output to show only errors/warnings.
+///
+/// Arguments execute directly, preserving every boundary Clap parsed. With
+/// `shell`, the single supplied script runs through that shell instead.
+pub fn run_err(command: &[String], shell: Option<&str>, verbose: u8) -> Result<i32> {
+    let display = display_args(command);
+    let cmd = command_from_args(command, shell).context("Failed to prepare err command")?;
+    run_err_cmd(cmd, "err", &display, "err", verbose)
 }
 
-/// Run a command via the shell and filter output to show only errors/warnings.
-pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
-    run_err_cmd(build_shell_command(command), "err", command, "err", verbose)
-}
-
-/// Run tests via the shell and show only failures.
-pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
+/// Run tests and show only failures.
+///
+/// Arguments execute directly, preserving every boundary Clap parsed. With
+/// `shell`, the single supplied script runs through that shell instead.
+pub fn run_test(command: &[String], shell: Option<&str>, verbose: u8) -> Result<i32> {
+    let display = display_args(command);
+    let cmd = command_from_args(command, shell).context("Failed to prepare test command")?;
     run_test_cmd(
-        build_shell_command(command),
+        cmd,
         "test",
-        command,
+        &display,
         "test",
-        crate::core::runner::TestEcosystem::detect(command),
+        TestEcosystem::detect(&display),
         verbose,
     )
 }
