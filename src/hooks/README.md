@@ -81,6 +81,16 @@ its strongest RTK verdict is `Ask`. Ask-capable hosts prompt, while other
 hosts retain their existing native permission flow. Unsupported or ambiguous
 wrapper syntax is left unchanged for the host to evaluate.
 
+Unambiguously-fish scripts (a fish-only keyword such as `end`, `begin`,
+`switch`, `and`, `or`, or `not` at command position, with no POSIX
+disambiguator) are rewritten to `rtk run --shell fish -c '<script>'` at the
+unattestable gate (`discover/fish_script.rs`) instead of being deferred, so
+POSIX host layers do not fail on fish syntax before the command runs. Like
+wrapper rewrites, the wrapped form is never auto-allowed — its strongest
+verdict is `Ask` — and deny rules are checked first. The wrap is skipped
+without a resolvable `fish` binary, on Windows, or when
+`hooks.wrap_fish_scripts = false`; those cases defer unchanged.
+
 | Verdict | Trigger | rewrite_cmd exit | Hook behavior |
 |---------|---------|-----------------|---------------|
 | Deny | `permissions.deny` rule matched | 2 | Passthrough — host tool handles denial |

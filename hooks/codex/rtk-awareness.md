@@ -25,6 +25,8 @@ rtk run --shell fish -c '<script>'
 
 Otherwise, use portable syntax because the host may evaluate a command before RTK starts.
 
+On hook-enabled hosts (e.g. Claude Code), unambiguously-fish scripts are wrapped into this form automatically. Codex has no rewrite hook, so wrap shell-specific scripts manually.
+
 ## Meta Commands
 
 ```bash

@@ -370,6 +370,28 @@ This support is intentionally conservative: it covers exact `sh -c`,
 in an outer double quote, additional shell options, redirects to files, `fish`
 scripts, and nested wrappers pass through unchanged.
 
+Unambiguously-fish scripts — multiline `if`/`for`/`switch` … `end` blocks or
+`; and` / `; or` chains — are the exception: instead of passing through to a
+host that may evaluate command strings with a POSIX-compatible layer (where
+fish syntax fails to parse), the hook wraps them for explicit fish execution:
+
+```fish
+if test -d src
+  git status
+end
+# → rtk run --shell fish -c 'if test -d src\n  git status\nend'
+```
+
+The script travels byte-identical inside one quoted argument, so both POSIX
+and fish host layers parse the wrapped command. The wrap always surfaces as an
+"ask" rewrite — never auto-allowed — because the script's content cannot be
+attested. It requires a resolvable `fish` binary, is disabled on Windows, and
+can be turned off with `wrap_fish_scripts = false` under `[hooks]` in the RTK
+config. Ambiguous scripts (shared `if`/`for` keywords without a fish-only
+marker, POSIX `then`/`do`/`fi` forms, heredocs) still pass through unchanged —
+keep writing intentionally shell-specific scripts as
+`rtk run --shell <shell> -c '<script>'`.
+
 ### Setup
 
 ```bash
