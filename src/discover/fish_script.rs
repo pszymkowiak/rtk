@@ -25,7 +25,6 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 /// is disabled, on Windows, when the command already delegates (`rtk …` or an
 /// explicit shell `-c` wrapper), when the script is not provably fish, or when no
 /// `fish` binary is resolvable.
-#[allow(dead_code)] // wired into the hook decision paths in a follow-up commit
 pub fn try_wrap(cmd: &str) -> Option<String> {
     let enabled = crate::core::config::Config::load()
         .map(|c| c.hooks.wrap_fish_scripts)

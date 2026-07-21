@@ -59,11 +59,35 @@ fn evaluate_with_verdict(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> RewriteOutcome {
+    evaluate_with_wrap(
+        cmd,
+        verdict,
+        excluded,
+        transparent_prefixes,
+        crate::discover::fish_script::try_wrap,
+    )
+}
+
+/// [`evaluate_with_verdict`] with the fish-script wrapper injected, so tests can
+/// pin the wrap outcome independently of the local fish binary and user config.
+fn evaluate_with_wrap(
+    cmd: &str,
+    verdict: PermissionVerdict,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    wrap_fish: fn(&str) -> Option<String>,
+) -> RewriteOutcome {
     if verdict == PermissionVerdict::Deny {
         return RewriteOutcome::Deny;
     }
 
     if crate::discover::lexer::contains_unattestable_construct(cmd) {
+        // Unambiguously-fish scripts would fail to parse in a POSIX host layer;
+        // hand the host an explicit-shell form instead. Always Ask (exit 3) —
+        // never auto-allow a script whose content cannot be attested.
+        if let Some(wrapped) = wrap_fish(cmd) {
+            return RewriteOutcome::Ask(wrapped);
+        }
         return RewriteOutcome::Passthrough;
     }
 
@@ -199,6 +223,65 @@ mod tests {
                 evaluate_with_verdict("git status", PermissionVerdict::Default, &[], &[]),
                 RewriteOutcome::Ask(_)
             ));
+        }
+    }
+
+    mod fish_wrap {
+        use super::super::{evaluate_with_wrap, RewriteOutcome};
+        use crate::hooks::permissions::PermissionVerdict;
+
+        /// Real classification and assembly with the environment gates pinned open.
+        fn wrap_stub(cmd: &str) -> Option<String> {
+            crate::discover::fish_script::try_wrap_gated(cmd, true)
+        }
+
+        /// Wrap unavailable (no fish binary, flag off, Windows).
+        fn wrap_none(_cmd: &str) -> Option<String> {
+            None
+        }
+
+        #[cfg(not(windows))]
+        #[test]
+        fn test_fish_script_rewrites_to_ask_wrap() {
+            // Ask (exit 3 + stdout) — the v3 sh hook prompts before running it.
+            assert_eq!(
+                evaluate_with_wrap(
+                    "test -d src; and git status",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[],
+                    wrap_stub
+                ),
+                RewriteOutcome::Ask("rtk run --shell fish -c 'test -d src; and git status'".into())
+            );
+        }
+
+        #[test]
+        fn test_fish_script_passes_through_when_wrap_unavailable() {
+            assert_eq!(
+                evaluate_with_wrap(
+                    "test -d src; and git status",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[],
+                    wrap_none
+                ),
+                RewriteOutcome::Passthrough
+            );
+        }
+
+        #[test]
+        fn test_posix_script_still_passes_through() {
+            assert_eq!(
+                evaluate_with_wrap(
+                    "if [ -d src ]; then git status; fi",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[],
+                    wrap_stub
+                ),
+                RewriteOutcome::Passthrough
+            );
         }
     }
 

@@ -257,10 +257,26 @@ enum HookDecision {
 }
 
 fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
+    decide_from_verdict_with(cmd, verdict, crate::discover::fish_script::try_wrap)
+}
+
+/// [`decide_from_verdict`] with the fish-script wrapper injected, so tests can
+/// pin the wrap outcome independently of the local fish binary and user config.
+fn decide_from_verdict_with(
+    cmd: &str,
+    verdict: PermissionVerdict,
+    wrap_fish: fn(&str) -> Option<String>,
+) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
         return HookDecision::Deny;
     }
     if crate::discover::lexer::contains_unattestable_construct(cmd) {
+        // Unambiguously-fish scripts would fail to parse in a POSIX host layer;
+        // hand the host an explicit-shell form instead. Never auto-allow the
+        // wrap: the script content is unattestable by definition.
+        if let Some(wrapped) = wrap_fish(cmd) {
+            return HookDecision::AskRewrite(wrapped);
+        }
         return HookDecision::Defer;
     }
     match get_rewritten(cmd) {
@@ -1682,9 +1698,49 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_fish_constructs_not_rewritten() {
+    fn test_claude_fish_substitution_not_rewritten() {
+        // Bare fish command substitution has no fish-only marker — still deferred.
         assert!(run_claude_inner(&claude_input("git status (printf x)")).is_none());
-        assert!(run_claude_inner(&claude_input("git status; and printf x")).is_none());
+    }
+
+    #[test]
+    fn test_claude_fish_and_chain_wraps_or_defers() {
+        // End-to-end through the real gates: wraps where the environment allows
+        // (fish on PATH, wrap_fish_scripts enabled), defers otherwise.
+        let cmd = "git status; and printf x";
+        match crate::discover::fish_script::try_wrap(cmd) {
+            Some(expected) => {
+                let out =
+                    run_claude_inner(&claude_input(cmd)).expect("fish script must be rewritten");
+                let v: Value = serde_json::from_str(&out).expect("hook output is valid JSON");
+                let hook = &v["hookSpecificOutput"];
+                assert_eq!(hook["updatedInput"]["command"], json!(expected));
+                assert!(
+                    hook.get("permissionDecision").is_none(),
+                    "wrapped fish scripts must never be auto-allowed"
+                );
+            }
+            None => {
+                // Wrap unavailable in this environment — the script must defer.
+                assert!(run_claude_inner(&claude_input(cmd)).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_claude_wraps_multiline_fish_block_without_auto_allow() {
+        let cmd = "if test -d src\n  git status\nelse\n  echo missing\nend";
+        let Some(expected) = crate::discover::fish_script::try_wrap(cmd) else {
+            return; // skip: fish wrap unavailable in this environment
+        };
+        let out = run_claude_inner(&claude_input(cmd)).expect("fish script must be rewritten");
+        let v: Value = serde_json::from_str(&out).expect("hook output is valid JSON");
+        let hook = &v["hookSpecificOutput"];
+        assert_eq!(hook["updatedInput"]["command"], json!(expected));
+        assert!(
+            hook.get("permissionDecision").is_none(),
+            "wrapped fish scripts must never be auto-allowed"
+        );
     }
 
     #[test]
@@ -2103,6 +2159,77 @@ mod tests {
             decide_with_rules("git status 2>&1", &[], &[], &all_allowed()),
             HookDecision::AllowRewrite(_)
         ));
+    }
+
+    // --- Fish-script wrapping at the unattestable gate ---
+
+    /// Real classification and assembly with the environment gates pinned open.
+    fn wrap_stub(cmd: &str) -> Option<String> {
+        crate::discover::fish_script::try_wrap_gated(cmd, true)
+    }
+
+    /// Wrap unavailable (no fish binary, flag off, Windows).
+    fn wrap_none(_cmd: &str) -> Option<String> {
+        None
+    }
+
+    const FISH_BLOCK: &str = "if test -d src\ngit status\nend";
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_decide_wraps_fish_script_as_ask() {
+        match decide_from_verdict_with(FISH_BLOCK, PermissionVerdict::Default, wrap_stub) {
+            HookDecision::AskRewrite(rewritten) => assert_eq!(
+                rewritten,
+                "rtk run --shell fish -c 'if test -d src\ngit status\nend'"
+            ),
+            _ => panic!("fish script must wrap as AskRewrite"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_decide_never_auto_allows_wrapped_fish_script() {
+        // SECURITY: even an Allow verdict on the raw string must not auto-allow
+        // the wrapped form — the script content is unattestable (#1155).
+        assert!(matches!(
+            decide_from_verdict_with(FISH_BLOCK, PermissionVerdict::Allow, wrap_stub),
+            HookDecision::AskRewrite(_)
+        ));
+    }
+
+    #[test]
+    fn test_decide_deny_wins_over_fish_wrap() {
+        assert!(matches!(
+            decide_from_verdict_with(FISH_BLOCK, PermissionVerdict::Deny, wrap_stub),
+            HookDecision::Deny
+        ));
+    }
+
+    #[test]
+    fn test_decide_defers_fish_script_when_wrap_unavailable() {
+        assert!(matches!(
+            decide_from_verdict_with(FISH_BLOCK, PermissionVerdict::Default, wrap_none),
+            HookDecision::Defer
+        ));
+    }
+
+    #[test]
+    fn test_decide_defers_posix_and_already_delegating_scripts() {
+        for cmd in [
+            "if [ -d src ]; then git status; fi",
+            "git status $(rm -rf /tmp/x)",
+            "rtk git status; and echo ok",
+            "fish -c 'if x; end'; and echo ok",
+        ] {
+            assert!(
+                matches!(
+                    decide_from_verdict_with(cmd, PermissionVerdict::Default, wrap_stub),
+                    HookDecision::Defer
+                ),
+                "expected Defer for {cmd}"
+            );
+        }
     }
 
     // --- Gemini rendering ---
