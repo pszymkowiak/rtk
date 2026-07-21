@@ -383,7 +383,7 @@ pub fn contains_unattestable_construct(cmd: &str) -> bool {
         .any(|(i, tok)| tok.kind == TokenKind::Redirect && redirect_has_file_target(&tokens, i))
 }
 
-fn has_unclosed_quote_or_escape(cmd: &str) -> bool {
+pub(crate) fn has_unclosed_quote_or_escape(cmd: &str) -> bool {
     let mut quote: Option<char> = None;
     let mut escaped = false;
 

@@ -34,7 +34,8 @@ When a hook sends `cargo fmt --all && cargo test 2>&1 | tail -20`:
 
 **Guards along the way:**
 - `RTK_DISABLED=1` in the env prefix → skip rewrite
-- Command/process substitution, parenthesized syntax, incomplete quoting, or a shell control keyword at a command boundary → defer unchanged to the host
+- Command/process substitution, parenthesized syntax, incomplete quoting, or a shell control keyword at a command boundary → defer unchanged to the host — except unambiguously-fish scripts, which `fish_script.rs` wraps as `rtk run --shell fish -c '<script>'` (Ask-gated, never auto-allowed)
+- Quoted shell wrappers that fall outside the conservative `-c` subset → defer unchanged to the host
 - `gh` with `--json`/`--jq`/`--template` → skip (structured output, rtk would corrupt it)
 - `cat` with flags other than `-n` → skip (different semantics than `rtk read`)
 - `cat`/`head`/`tail` with `>` or `>>` → skip (write operation, not a read)
