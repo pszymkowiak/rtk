@@ -67,6 +67,24 @@ mod unix {
         assert!(output.stdout.is_empty());
     }
 
+    #[test]
+    fn rewrite_defers_fish_script_with_divergent_backslash() {
+        if which::which("fish").is_err() {
+            return; // with fish present, the veto is the only reason to defer
+        }
+        // Classifies fish (`; and` marker) but contains `\\`, which fish
+        // single-quotes would collapse — the wrapper vetoes it, so the hook
+        // defers instead of emitting a wrap that would corrupt the script.
+        let output = rewrite_isolated("echo '\\\\'; and echo ok", None);
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "divergent backslash must defer"
+        );
+        assert!(output.stdout.is_empty());
+    }
+
     /// Mirror of `fish_script::escape_single_quoted` — tests/ cannot reach
     /// crate internals, and duplicating one replace keeps this test honest
     /// about what the emitted command actually contains.
@@ -76,7 +94,10 @@ mod unix {
 
     #[test]
     fn wrapped_quoting_round_trips_under_posix_and_fish_hosts() {
-        let script = "if test -d src\n  echo 'a b'\nelse\n  echo missing\nend";
+        // The `%s\n` carries a lone backslash inside single quotes: literal
+        // under both POSIX and fish, so it must arrive byte-identical (unlike
+        // `\\`/`\'`, which the wrapper vetoes upstream).
+        let script = "if test -d src\n  printf '%s\\n' 'a b'\nelse\n  echo missing\nend";
         let probe = format!("printf '%s' '{}'", escape_single_quoted(script));
 
         for shell in ["sh", "zsh", "fish"] {

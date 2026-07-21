@@ -21,22 +21,45 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 
 /// Wrap `cmd` for explicit fish execution when it is unambiguously a fish script.
 ///
-/// Returns `None` (caller keeps its defer behavior) when `hooks.wrap_fish_scripts`
-/// is disabled, on Windows, when the command already delegates (`rtk …` or an
-/// explicit shell `-c` wrapper), when the script is not provably fish, or when no
-/// `fish` binary is resolvable.
+/// Returns `None` (caller keeps its defer behavior) when the script is not
+/// provably fish, when the command already delegates (`rtk …` or an explicit
+/// shell `-c` wrapper), when the script contains a fish-divergent backslash
+/// sequence (`\\` or `\'`), on Windows, when `hooks.wrap_fish_scripts` is
+/// disabled, or when no `fish` binary is resolvable.
+///
+/// The cheap, pure classification runs first; the config read and the `fish`
+/// PATH probe run only once the command is classified fish. So common non-fish
+/// commands reaching the unattestable gate (`echo $(date)`, `git log > out`,
+/// POSIX blocks) do zero I/O here.
 pub fn try_wrap(cmd: &str) -> Option<String> {
-    let enabled = crate::core::config::Config::load()
-        .map(|c| c.hooks.wrap_fish_scripts)
-        .unwrap_or(true);
-    if !enabled {
-        return None;
-    }
-    try_wrap_gated(cmd, crate::core::utils::resolve_binary("fish").is_ok())
+    try_wrap_with_probes(
+        cmd,
+        || {
+            crate::core::config::Config::load()
+                .map(|c| c.hooks.wrap_fish_scripts)
+                .unwrap_or(true)
+        },
+        || crate::core::utils::resolve_binary("fish").is_ok(),
+    )
 }
 
-/// [`try_wrap`] with the fish-binary probe injected, for deterministic tests.
+/// [`try_wrap`] with the fish-binary probe injected and the config assumed
+/// enabled, for deterministic tests. Pure: never reads the RTK config.
+#[cfg(test)]
 pub(crate) fn try_wrap_gated(cmd: &str, fish_available: bool) -> Option<String> {
+    try_wrap_with_probes(cmd, || true, || fish_available)
+}
+
+/// Shared gate chain for [`try_wrap`] and `try_wrap_gated`. The pure checks
+/// (platform, delegation skip, fish classification, backslash veto) run before
+/// the two probes, which are consulted only once the script is confirmed fish;
+/// both are `FnOnce`, so a caller pays for the config read and the PATH scan
+/// only on the fish path.
+fn try_wrap_with_probes(
+    cmd: &str,
+    enabled: impl FnOnce() -> bool,
+    fish: impl FnOnce() -> bool,
+) -> Option<String> {
     if cfg!(windows) {
         // cmd/PowerShell host layers do not honor POSIX single quotes, so the
         // wrapped form could be mis-tokenized before reaching rtk.
@@ -47,7 +70,19 @@ pub(crate) fn try_wrap_gated(cmd: &str, fish_available: bool) -> Option<String> 
     if script.split_whitespace().next() == Some("rtk") || is_shell_wrapper_candidate(script) {
         return None;
     }
-    if !is_unambiguous_fish(script) || !fish_available {
+    if !is_unambiguous_fish(script) {
+        return None;
+    }
+    // Fish single-quoted strings diverge from POSIX single-quote semantics for
+    // exactly two sequences: `\\` collapses to one backslash and `\'` becomes a
+    // literal quote (a backslash before any other character is literal in both).
+    // Refuse scripts containing either sequence so every wrapped script
+    // round-trips byte-identically under sh/bash/zsh *and* fish host layers. A
+    // lone backslash (e.g. `printf '%s\n'`) still wraps.
+    if script.contains("\\\\") || script.contains("\\'") {
+        return None;
+    }
+    if !enabled() || !fish() {
         return None;
     }
 
@@ -261,6 +296,33 @@ mod tests {
             try_wrap_gated("echo 'a b'; and echo done", true).as_deref(),
             Some("rtk run --shell fish -c 'echo '\\''a b'\\''; and echo done'")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_single_backslash_script_is_wrapped() {
+        // A lone backslash before an ordinary char is literal under both POSIX
+        // and fish single-quotes, so an otherwise-fish script still wraps.
+        assert_eq!(
+            try_wrap_gated("printf '%s\\n' hi; and echo done", true).as_deref(),
+            Some("rtk run --shell fish -c 'printf '\\''%s\\n'\\'' hi; and echo done'")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_double_backslash_script_is_not_wrapped() {
+        // Classifies fish (`; and` marker) but contains `\\`, which fish
+        // single-quotes collapse to one backslash — refuse so the wrap
+        // round-trips byte-identically under a fish host layer.
+        assert!(try_wrap_gated("echo '\\\\'; and echo ok", true).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_backslash_quote_script_is_not_wrapped() {
+        // Contains `\'`, which fish single-quotes turn into a literal quote.
+        assert!(try_wrap_gated("echo \\'; and echo ok", true).is_none());
     }
 
     #[test]
