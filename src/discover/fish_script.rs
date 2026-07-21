@@ -21,11 +21,18 @@ const POSIX_ONLY_KEYWORDS: &[&str] = &["then", "fi", "do", "done", "esac", "elif
 
 /// Wrap `cmd` for explicit fish execution when it is unambiguously a fish script.
 ///
-/// Returns `None` (caller keeps its defer behavior) on Windows, when the command
-/// already delegates (`rtk …` or an explicit shell `-c` wrapper), when the script
-/// is not provably fish, or when no `fish` binary is resolvable.
+/// Returns `None` (caller keeps its defer behavior) when `hooks.wrap_fish_scripts`
+/// is disabled, on Windows, when the command already delegates (`rtk …` or an
+/// explicit shell `-c` wrapper), when the script is not provably fish, or when no
+/// `fish` binary is resolvable.
 #[allow(dead_code)] // wired into the hook decision paths in a follow-up commit
 pub fn try_wrap(cmd: &str) -> Option<String> {
+    let enabled = crate::core::config::Config::load()
+        .map(|c| c.hooks.wrap_fish_scripts)
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
     try_wrap_gated(cmd, crate::core::utils::resolve_binary("fish").is_ok())
 }
 

@@ -23,7 +23,7 @@ pub struct Config {
     pub limits: LimitsConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HooksConfig {
     /// Commands to exclude from auto-rewrite (e.g. ["curl", "playwright"]).
     /// Survives `rtk init -g` re-runs since config.toml is user-owned.
@@ -51,6 +51,28 @@ pub struct HooksConfig {
     /// not anything else.
     #[serde(default)]
     pub transparent_prefixes: Vec<String>,
+
+    /// Rewrite unambiguously-fish scripts (`if … end` blocks, `; and` chains)
+    /// to `rtk run --shell fish -c '<script>'` in the hook rewrite paths, so
+    /// hosts that evaluate command strings with a POSIX layer don't fail on
+    /// fish-only syntax. Wrapped commands are never auto-allowed. Set to
+    /// false to keep the plain defer/passthrough behavior.
+    #[serde(default = "default_true")]
+    pub wrap_fish_scripts: bool,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            exclude_commands: Vec::new(),
+            transparent_prefixes: Vec::new(),
+            wrap_fish_scripts: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -258,6 +280,28 @@ exclude_commands = ["curl", "gh"]
         let config = Config::default();
         assert!(config.hooks.exclude_commands.is_empty());
         assert!(config.hooks.transparent_prefixes.is_empty());
+        assert!(config.hooks.wrap_fish_scripts);
+    }
+
+    #[test]
+    fn test_hooks_config_wrap_fish_scripts_missing_defaults_true() {
+        // Older configs that predate this field must keep wrapping enabled.
+        let toml = r#"
+[hooks]
+exclude_commands = ["curl"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(config.hooks.wrap_fish_scripts);
+    }
+
+    #[test]
+    fn test_hooks_config_wrap_fish_scripts_opt_out() {
+        let toml = r#"
+[hooks]
+wrap_fish_scripts = false
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(!config.hooks.wrap_fish_scripts);
     }
 
     #[test]
