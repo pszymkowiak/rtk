@@ -98,10 +98,24 @@ Before a hook emits `updatedInput`, the shared lexer rejects constructs whose
 shell semantics cannot be safely attested: command/process substitution,
 parenthesized syntax (including fish command substitution), incomplete
 quoting, file-target redirects, and shell control keywords at command
-boundaries. These commands are returned to the host unchanged. The host still
-owns command parsing and shell selection; RTK never translates syntax between
-fish, POSIX shells, and zsh.
+boundaries. These commands are returned to the host unchanged, with one
+carve-out: an unambiguously-fish script — a fish-only keyword such as `end`
+at command position with no POSIX disambiguator — is rewritten to
+`rtk run --shell fish -c '<script>'` (`src/discover/fish_script.rs`), never
+auto-allowed and gated on fish availability, non-Windows, and
+`hooks.wrap_fish_scripts`, so a POSIX host layer does not fail on fish
+syntax. Otherwise the host still owns command parsing and shell selection;
+and even the wrap never translates syntax between fish, POSIX shells, and
+zsh — it delegates the script verbatim to fish.
 
+A second narrow exception is a quoted command string passed through an exact
+`sh -c`, `bash -c`, `zsh -c`, or `fish -c` wrapper. RTK can rewrite the
+portable inner command subset while preserving the original wrapper, quote
+delimiters, whitespace, and suffix arguments. RTK never marks the wrapper
+auto-allowed: Ask-capable hosts receive `Ask`, other hosts retain their native
+permission flow, and inner deny rules still take precedence. Active outer
+expansion, unsupported shell options, fish-specific control syntax, file
+redirects, and nested wrappers remain passthrough.
 > **Details**: [`hooks/README.md`](../hooks/README.md) covers each agent's JSON format, the rewrite registry, compound command handling, and the `RTK_DISABLED` override.
 
 #### Rewrite Pipeline

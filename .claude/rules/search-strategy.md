@@ -20,7 +20,8 @@ src/
 │   ├── config.rs              ← ~/.config/rtk/config.toml
 │   ├── tracking.rs            ← SQLite token metrics
 │   ├── tee.rs                 ← Raw output recovery on failure
-│   ├── utils.rs               ← strip_ansi, truncate, execute_command
+│   ├── shell.rs               ← Direct/explicit-shell command builders (rtk run --shell)
+│   ├── utils.rs               ← strip_ansi, truncate, execute_command, resolve_binary
 │   ├── filter.rs              ← Language-aware code filtering engine
 │   ├── toml_filter.rs         ← TOML DSL filter engine
 │   ├── display_helpers.rs     ← Terminal formatting helpers
@@ -33,13 +34,13 @@ src/
 │   └── stream.rs              ← Streaming output handling
 ├── hooks/                     ← Hook system
 │   ├── init.rs                ← rtk init command
-│   ├── rewrite_cmd.rs         ← rtk rewrite command
-│   ├── hook_cmd.rs            ← Gemini/Copilot hook processors
+│   ├── rewrite_cmd.rs         ← rtk rewrite command (legacy sh-hook path)
+│   ├── hook_cmd.rs            ← Native hook processors (Claude/Copilot/Gemini/Droid)
+│   ├── permissions.rs         ← Claude Code permission rules → verdicts (deny/ask/allow)
 │   ├── hook_check.rs          ← Hook status detection
 │   ├── hook_audit_cmd.rs      ← rtk hook audit command
 │   ├── verify_cmd.rs          ← rtk verify command
 │   ├── trust.rs               ← Project trust/untrust
-│   ├── permissions.rs         ← Hook permission handling
 │   ├── constants.rs           ← Shared hook constants
 │   └── integrity.rs           ← SHA-256 hook verification
 ├── analytics/                 ← Token savings analytics
@@ -59,7 +60,14 @@ src/
 │   ├── ruby/                  ← rake, rspec, rubocop
 │   ├── jvm/                   ← gradlew, mvn
 │   └── php/                   ← php, artisan, phpunit, phpstan, pest, paratest, ecs, pint
-├── discover/                  ← Claude Code history analysis
+├── discover/                  ← Command rewrite engine + history analysis
+│   ├── lexer.rs               ← Quote-aware tokenizer + unattestable-construct gate
+│   ├── registry.rs            ← Rewrite rules registry (hook hot path)
+│   ├── rules.rs               ← Rewrite rule definitions
+│   ├── shell_wrapper.rs       ← Quoted shell -c wrapper parsing
+│   ├── fish_script.rs         ← Fish-script classifier + rtk run --shell fish wrap
+│   ├── provider.rs            ← Session providers (Claude Code JSONL)
+│   └── report.rs              ← Discover report rendering
 ├── learn/                     ← CLI correction detection
 ├── parser/                    ← Parser infrastructure
 └── filters/                   ← 63 TOML filter configs
