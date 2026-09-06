@@ -680,7 +680,7 @@ pub fn run(
         && (paths.is_empty() || paths.iter().any(|path| path == "-"));
 
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
-    if has_format_flag(&extra_args) {
+    if has_format_flag(engine, &extra_args) {
         return passthrough(&timer, engine, &args, &real_cmd, reads_piped_stdin);
     }
 
@@ -882,7 +882,7 @@ fn parse_match_line(line: &str) -> Option<(String, usize, bool, &str)> {
     })
 }
 
-fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
+fn has_format_flag<T: AsRef<str>>(engine: Engine, extra_args: &[T]) -> bool {
     // Minimal/shape forms the agent already chose; short flags scanned per-letter
     // so clusters like -rl/-rq route through, plus their long forms.
     const LONG: &[&str] = &[
@@ -907,10 +907,15 @@ fn has_format_flag<T: AsRef<str>>(extra_args: &[T]) -> bool {
         if a.starts_with("--") {
             LONG.contains(&a.split('=').next().unwrap_or(a))
         } else if let Some(letters) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
-            // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL
-            letters
-                .chars()
-                .any(|ch| matches!(ch, 'c' | 'l' | 'L' | 'o' | 'q' | 'b' | 'Z' | 'z'))
+            // -c count, -l/-L lists, -o only-matching, -q quiet, -b byte-offset, -Z/-z NUL.
+            // For rg, -L is --follow (symlinks, confirmed byte-identical in output)
+            // and -Z does not exist at all — both are false positives that only
+            // cost compression. -z (--null-data) stays for rg: it genuinely
+            // changes the line parse. Grep keeps all eight letters.
+            letters.chars().any(|ch| match engine {
+                Engine::Grep => matches!(ch, 'c' | 'l' | 'L' | 'o' | 'q' | 'b' | 'Z' | 'z'),
+                Engine::Rg => matches!(ch, 'c' | 'l' | 'o' | 'q' | 'b' | 'z'),
+            })
         } else {
             false
         }
@@ -1456,22 +1461,22 @@ mod tests {
 
     #[test]
     fn test_format_flag_detects_count_matches() {
-        assert!(has_format_flag(&["--count-matches"]));
+        assert!(has_format_flag(Engine::Grep, &["--count-matches"]));
     }
 
     #[test]
     fn test_format_flag_detects_json() {
-        assert!(has_format_flag(&["--json"]));
+        assert!(has_format_flag(Engine::Grep, &["--json"]));
     }
 
     #[test]
     fn test_format_flag_detects_passthru() {
-        assert!(has_format_flag(&["--passthru"]));
+        assert!(has_format_flag(Engine::Grep, &["--passthru"]));
     }
 
     #[test]
     fn test_format_flag_detects_files() {
-        assert!(has_format_flag(&["--files"]));
+        assert!(has_format_flag(Engine::Grep, &["--files"]));
     }
 
     // --- truncation accuracy ---
@@ -1499,69 +1504,91 @@ mod tests {
 
     #[test]
     fn test_format_flag_detects_count() {
-        assert!(has_format_flag(&["-c"]));
-        assert!(has_format_flag(&["--count"]));
+        assert!(has_format_flag(Engine::Grep, &["-c"]));
+        assert!(has_format_flag(Engine::Grep, &["--count"]));
     }
 
     #[test]
     fn test_format_flag_detects_files_with_matches() {
-        assert!(has_format_flag(&["-l"]));
-        assert!(has_format_flag(&["--files-with-matches"]));
+        assert!(has_format_flag(Engine::Grep, &["-l"]));
+        assert!(has_format_flag(Engine::Grep, &["--files-with-matches"]));
     }
 
     #[test]
     fn test_format_flag_detects_files_without_match() {
-        assert!(has_format_flag(&["-L"]));
-        assert!(has_format_flag(&["--files-without-match"]));
+        assert!(has_format_flag(Engine::Grep, &["-L"]));
+        assert!(has_format_flag(Engine::Grep, &["--files-without-match"]));
     }
 
     #[test]
     fn test_format_flag_detects_only_matching() {
-        assert!(has_format_flag(&["-o"]));
-        assert!(has_format_flag(&["--only-matching"]));
+        assert!(has_format_flag(Engine::Grep, &["-o"]));
+        assert!(has_format_flag(Engine::Grep, &["--only-matching"]));
     }
 
     #[test]
     fn test_format_flag_detects_null() {
-        assert!(has_format_flag(&["-Z"]));
-        assert!(has_format_flag(&["--null"]));
+        assert!(has_format_flag(Engine::Grep, &["-Z"]));
+        assert!(has_format_flag(Engine::Grep, &["--null"]));
     }
 
     #[test]
     fn test_format_flag_ignores_normal_flags() {
-        assert!(!has_format_flag(&["-i", "-w", "-A", "3"]));
+        assert!(!has_format_flag(Engine::Grep, &["-i", "-w", "-A", "3"]));
     }
 
     #[test]
     fn test_format_flag_detects_clusters() {
         // clustered minimal forms must route to passthrough, not GROUP
-        assert!(has_format_flag(&["-rl"]));
-        assert!(has_format_flag(&["-rc"]));
-        assert!(has_format_flag(&["-rq"]));
-        assert!(has_format_flag(&["-rln"]));
-        assert!(has_format_flag(&["-cr"]));
+        assert!(has_format_flag(Engine::Grep, &["-rl"]));
+        assert!(has_format_flag(Engine::Grep, &["-rc"]));
+        assert!(has_format_flag(Engine::Grep, &["-rq"]));
+        assert!(has_format_flag(Engine::Grep, &["-rln"]));
+        assert!(has_format_flag(Engine::Grep, &["-cr"]));
     }
 
     #[test]
     fn test_format_flag_detects_quiet_and_shape() {
-        assert!(has_format_flag(&["-q"]));
-        assert!(has_format_flag(&["--quiet"]));
-        assert!(has_format_flag(&["--silent"]));
-        assert!(has_format_flag(&["-b"]));
-        assert!(has_format_flag(&["--byte-offset"]));
-        assert!(has_format_flag(&["--column"]));
-        assert!(has_format_flag(&["--vimgrep"]));
-        assert!(has_format_flag(&["-z"]));
-        assert!(has_format_flag(&["--null-data"]));
+        assert!(has_format_flag(Engine::Grep, &["-q"]));
+        assert!(has_format_flag(Engine::Grep, &["--quiet"]));
+        assert!(has_format_flag(Engine::Grep, &["--silent"]));
+        assert!(has_format_flag(Engine::Grep, &["-b"]));
+        assert!(has_format_flag(Engine::Grep, &["--byte-offset"]));
+        assert!(has_format_flag(Engine::Grep, &["--column"]));
+        assert!(has_format_flag(Engine::Grep, &["--vimgrep"]));
+        assert!(has_format_flag(Engine::Grep, &["-z"]));
+        assert!(has_format_flag(Engine::Grep, &["--null-data"]));
     }
 
     #[test]
     fn test_format_flag_compresses_default_and_context() {
         // compressible forms must NOT passthrough
-        assert!(!has_format_flag(&["-rn"]));
-        assert!(!has_format_flag(&["-A", "3"]));
-        assert!(!has_format_flag(&["-v"]));
-        assert!(!has_format_flag(&["-rin"]));
+        assert!(!has_format_flag(Engine::Grep, &["-rn"]));
+        assert!(!has_format_flag(Engine::Grep, &["-A", "3"]));
+        assert!(!has_format_flag(Engine::Grep, &["-v"]));
+        assert!(!has_format_flag(Engine::Grep, &["-rin"]));
+    }
+
+    // --- Phase 4: has_format_flag is engine-aware ---
+
+    #[test]
+    fn has_format_flag_rg_ignores_follow_and_absent_devices() {
+        // rg: -L is --follow (symlinks, confirmed byte-identical output) and -Z
+        // does not exist at all — both are false positives that only cost
+        // compression, never correctness.
+        assert!(!has_format_flag(Engine::Rg, &["-L"]));
+        assert!(!has_format_flag(Engine::Rg, &["-Z"]));
+    }
+
+    #[test]
+    fn has_format_flag_grep_still_treats_l_as_format_shape() {
+        assert!(has_format_flag(Engine::Grep, &["-L"]));
+    }
+
+    #[test]
+    fn has_format_flag_rg_keeps_null_data() {
+        // -z / --null-data genuinely changes rg's line parse — keep the bail-out.
+        assert!(has_format_flag(Engine::Rg, &["-z"]));
     }
 
     fn flags(args: &[&str]) -> Vec<String> {
