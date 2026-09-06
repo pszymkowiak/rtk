@@ -142,10 +142,15 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
 /// terminates the cluster — everything after it is its inline value, not a
 /// separate flag. Long value-taking flags consume the next token. `--` marks
 /// everything after it as positional.
+///
+/// `-f`/`--file` supplies patterns from a file, so no positional is a pattern.
+/// It always leaves `patterns` empty — even alongside `-e` — which makes `run()`
+/// hand the original argv to the engine verbatim rather than guess.
 fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
+    let mut pattern_source = false;
     let mut past_dashdash = false;
     let mut i = 0;
 
@@ -174,6 +179,10 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                     i += 1;
                 }
                 continue;
+            }
+            // --file reads patterns from a file: no positional is a pattern.
+            if arg == "--file" || arg.starts_with("--file=") {
+                pattern_source = true;
             }
             // Other long value-taking flags: consume next token as value.
             if VALUE_FLAGS_LONG.contains(&arg) {
@@ -219,6 +228,8 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
                             i += 1;
                         }
                     } else {
+                        // -f reads patterns from a file: no positional is a pattern.
+                        pattern_source |= flag == 'f';
                         flags.push(format!("-{}", flag));
                         if !inline.is_empty() {
                             flags.push(inline);
@@ -239,9 +250,14 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
         }
     }
 
-    // If -e/--regexp was used: all positionals are paths.
+    // -f/--file: the patterns live in a file RTK does not read, so it cannot know
+    // them. Return none — `run()` bails to passthrough. Any `-e` value is dropped
+    // with them; passthrough re-execs the original argv, so nothing reads these.
+    // Otherwise -e/--regexp supplies the patterns and all positionals are paths.
     // Otherwise: first positional is the pattern, rest are paths.
-    let (patterns, paths) = if !e_patterns.is_empty() {
+    let (patterns, paths) = if pattern_source {
+        (Vec::new(), positionals)
+    } else if !e_patterns.is_empty() {
         (e_patterns, positionals)
     } else {
         let paths = positionals.iter().skip(1).cloned().collect();
@@ -1651,5 +1667,61 @@ mod tests {
         assert!(f(&["--before-context=2"]));
         assert!(f(&["--context=1"]));
         assert!(!f(&["--color", "auto"]));
+    }
+
+    // -f/--file supplies the patterns from a file RTK never reads, so every
+    // positional is a path and `patterns` stays empty -> run() passes through.
+
+    #[test]
+    fn pattern_source_short_f_leaves_patterns_empty() {
+        let (patterns, paths, flags) = extract_pattern_path(&["-f", "pat.txt", "a.txt"]);
+        assert!(patterns.is_empty());
+        assert_eq!(paths, vec!["a.txt"]);
+        assert_eq!(flags, vec!["-f", "pat.txt"]);
+    }
+
+    #[test]
+    fn pattern_source_long_file_leaves_patterns_empty() {
+        let (patterns, paths, flags) = extract_pattern_path(&["--file", "pat.txt", "a.txt"]);
+        assert!(patterns.is_empty());
+        assert_eq!(paths, vec!["a.txt"]);
+        assert_eq!(flags, vec!["--file", "pat.txt"]);
+    }
+
+    #[test]
+    fn pattern_source_long_file_inline_leaves_patterns_empty() {
+        let (patterns, paths, flags) = extract_pattern_path(&["--file=pat.txt", "a.txt"]);
+        assert!(patterns.is_empty());
+        assert_eq!(paths, vec!["a.txt"]);
+        assert_eq!(flags, vec!["--file=pat.txt"]);
+    }
+
+    #[test]
+    fn pattern_source_short_f_multi_file_keeps_every_positional_as_path() {
+        let (patterns, paths, _) = extract_pattern_path(&["-f", "pat.txt", "a.txt", "b.txt"]);
+        assert!(patterns.is_empty());
+        assert_eq!(paths, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn pattern_source_files_is_not_a_source() {
+        // rg's --files must not be mistaken for --file by a prefix match.
+        let (patterns, paths, _) = extract_pattern_path(&["--files", "foo", "src"]);
+        assert_eq!(patterns, vec!["foo"]);
+        assert_eq!(paths, vec!["src"]);
+    }
+
+    #[test]
+    fn pattern_source_e_plus_f_still_bails() {
+        // -e alongside -f must NOT keep patterns non-empty: RTK still cannot know
+        // the file's patterns, so it must bail to passthrough rather than group
+        // against a pattern that misses most matches.
+        let (patterns, paths, flags) =
+            extract_pattern_path(&["-e", "foo", "-f", "pat.txt", "a.txt"]);
+        assert!(patterns.is_empty());
+        assert_eq!(paths, vec!["a.txt"]);
+        // The engine still receives everything via the original argv; flags keep -f.
+        assert!(flags.contains(&"-f".to_string()));
+        assert!(flags.contains(&"pat.txt".to_string()));
     }
 }
