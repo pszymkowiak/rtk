@@ -281,7 +281,7 @@ Analytics commands (`rtk gain`, `rtk cc-economics`, `rtk session`) query this da
 On command failure (non-zero exit code):
 
 1. Raw unfiltered output is saved to `~/.local/share/rtk/tee/{epoch}_{slug}.log`
-2. A hint line is printed: `[full output: ~/.../tee/1234_cargo_test.log]`
+2. A hint line is printed: `[full output: ~/.../tee/1234_cargo_test.log — may contain sensitive data]`
 3. LLM agents can re-read the file instead of re-running the failed command
 
 Tee is configurable (enabled/disabled, min size, max files, max file size) and never affects command output or exit code on failure.

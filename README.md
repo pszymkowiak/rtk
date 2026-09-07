@@ -437,7 +437,7 @@ When a command fails, RTK saves the full unfiltered output so the LLM can read i
 
 ```
 FAILED: 2/15 tests
-[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log]
+[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log — may contain sensitive data]
 ```
 
 For the full config reference (all sections, env vars, per-project filters), see the [Configuration guide](https://www.rtk-ai.app/guide/getting-started/configuration).

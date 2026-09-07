@@ -1376,7 +1376,7 @@ Quand une commande echoue, RTK sauvegarde automatiquement la sortie brute comple
 **Sortie :**
 ```
 FAILED: 2/15 tests
-[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log]
+[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log — may contain sensitive data]
 ```
 
 **Configuration :**
