@@ -571,6 +571,8 @@ rtk test bun test
 rtk test pytest
 ```
 
+`rtk test` attend une commande de runner de tests. Ce n'est pas le builtin POSIX `test`; pour verifier une condition shell, utilisez `rtk run "test -d path"` ou `test -d path` directement.
+
 **Avant / Apres :**
 ```
 # cargo test (200+ lignes en cas d'echec)   # rtk test cargo test (~20 lignes)

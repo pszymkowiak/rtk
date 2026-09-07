@@ -1445,6 +1445,24 @@ enum DenoCommands {
     Other(Vec<OsString>),
 }
 
+const POSIX_TEST_UNARY_FLAGS: &[&str] = &[
+    "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n", "-O", "-p", "-r", "-S", "-s", "-u",
+    "-w", "-x", "-z", "-G",
+];
+
+fn posix_test_misuse_message(command: &[String]) -> Option<String> {
+    let first = command.first()?;
+    if !POSIX_TEST_UNARY_FLAGS.contains(&first.as_str()) {
+        return None;
+    }
+
+    let expression = command.join(" ");
+    Some(format!(
+        "rtk test is for test runners, not POSIX test; use `rtk run \"test {}\"` or direct `test {}`",
+        expression, expression
+    ))
+}
+
 /// Route `bunx <tool>` and `bun x <tool>` to the matching tool filter,
 /// falling back to the generic bunx runner for unrecognized tools.
 fn run_bunx_tool(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
@@ -2038,6 +2056,9 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Test { command } => {
+            if let Some(message) = posix_test_misuse_message(&command) {
+                anyhow::bail!("{}", message);
+            }
             let cmd = command.join(" ");
             runner::run_test(&cmd, cli.verbose)?
         }
@@ -3541,6 +3562,32 @@ mod tests {
                 Commands::Ctest { args } => assert_eq!(args, vec![flag]),
                 _ => panic!("Expected Ctest command"),
             }
+        }
+    }
+
+    #[test]
+    fn test_posix_test_flag_gets_targeted_message() {
+        let command = vec!["-d".to_string(), "path".to_string()];
+        let message = posix_test_misuse_message(&command).unwrap();
+        assert!(message.contains("rtk test is for test runners"));
+        assert!(message.contains("rtk run \"test -d path\""));
+    }
+
+    #[test]
+    fn test_test_runner_command_does_not_get_posix_message() {
+        let command = vec!["cargo".to_string(), "test".to_string()];
+        assert!(posix_test_misuse_message(&command).is_none());
+    }
+
+    #[test]
+    fn test_test_command_with_dash_d_still_parses() {
+        let cli = Cli::try_parse_from(["rtk", "test", "-d", "path"]).unwrap();
+        match cli.command {
+            Commands::Test { command } => {
+                assert_eq!(command, vec!["-d", "path"]);
+                assert!(posix_test_misuse_message(&command).is_some());
+            }
+            _ => panic!("Expected Test command"),
         }
     }
 

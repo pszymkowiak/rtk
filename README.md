@@ -201,6 +201,8 @@ rtk err <cmd>                   # Filter errors only from any command
 rtk test <cmd>                  # Generic test wrapper - failures only (-90%)
 ```
 
+`rtk test` expects a test-runner command, for example `rtk test cargo test`. It is not POSIX `test`; use `rtk run "test -d path"` or direct `test -d path` for shell condition checks.
+
 ### Build & Lint
 ```bash
 rtk lint                        # ESLint grouped by rule/file
