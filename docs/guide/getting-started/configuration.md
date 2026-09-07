@@ -94,7 +94,7 @@ When a command fails, RTK saves the full raw output to a local file and prints t
 
 ```
 FAILED: 2/15 tests
-[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log]
+[full output: ~/.local/share/rtk/tee/1707753600_cargo_test.log — may contain sensitive data]
 ```
 
 Your AI assistant can then read the file if it needs more detail, without re-running the command.

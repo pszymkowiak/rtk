@@ -261,8 +261,14 @@ fn display_shell_path(path: &std::path::Path) -> String {
     format!("\"{}\"", escape_double_quoted_path(&display))
 }
 
+/// The tee file is raw, unfiltered output: failing commands routinely echo
+/// tokens, API keys, and connection strings, so the hint says so before an
+/// agent quotes the file into a transcript or a bug report.
 fn format_hint(path: &std::path::Path) -> String {
-    format!("[full output: {}]", display_shell_path(path))
+    format!(
+        "[full output: {} — may contain sensitive data]",
+        display_shell_path(path)
+    )
 }
 
 /// Convenience: tee + format hint in one call.
@@ -588,6 +594,15 @@ mod tests {
     }
 
     #[test]
+    fn test_format_hint_warns_about_sensitive_data() {
+        let path = PathBuf::from("/tmp/rtk/tee/123_cargo_test.log");
+        assert_eq!(
+            format_hint(&path),
+            "[full output: /tmp/rtk/tee/123_cargo_test.log — may contain sensitive data]"
+        );
+    }
+
+    #[test]
     fn test_display_shell_path_preserves_simple_paths() {
         let path = PathBuf::from("/tmp/rtk/tee/123_cargo_test.log");
         assert_eq!(display_shell_path(&path), "/tmp/rtk/tee/123_cargo_test.log");
@@ -644,7 +659,7 @@ mod tests {
 
         assert_eq!(
             hint,
-            "[full output: \"$HOME/Library/Application Support/rtk/tee/123_go_test.log\"]"
+            "[full output: \"$HOME/Library/Application Support/rtk/tee/123_go_test.log\" — may contain sensitive data]"
         );
         assert!(
             !hint.contains("\\ "),
