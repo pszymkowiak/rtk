@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.91"
 authors = ["Patrick Szymkowiak"]
 description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
-license = "Apache 2.0"
+license = "Apache-2.0"
 homepage = "https://www.rtk-ai.app"
 repository = "https://github.com/rtk-ai/rtk"
 readme = "README.md"
@@ -53,8 +53,6 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 toml = "0.8"
-
-[dev-dependencies]
 
 [profile.release]
 opt-level = 3
