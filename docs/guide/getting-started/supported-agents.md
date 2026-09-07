@@ -288,6 +288,8 @@ Hooks never block command execution. If RTK is missing, the hook exits cleanly a
 RTK_DISABLED=1 git status    # runs raw git status, no rewrite
 ```
 
+Exported in the environment (`export RTK_DISABLED=1`) it applies to every command instead: `rtk rewrite` passes them all through, so the hooks and plugins that delegate to it stand down for that shell or process tree.
+
 Or exclude commands permanently in `~/.config/rtk/config.toml`:
 
 ```toml

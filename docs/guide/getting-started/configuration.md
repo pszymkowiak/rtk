@@ -82,7 +82,7 @@ since the agent must type `rtk` itself. `rtk init` prints a note when it does th
 
 | Variable | Description |
 |----------|-------------|
-| `RTK_DISABLED=1` | Disable RTK for a single command (`RTK_DISABLED=1 git status`) |
+| `RTK_DISABLED=1` | Disable RTK for a single command (`RTK_DISABLED=1 git status`). Also honoured when exported in the environment: `rtk rewrite` then passes every command through, so hooks and plugins that delegate to it stand down for that shell or process tree. |
 | `RTK_TEE_DIR` | Override the tee directory |
 | `RTK_TELEMETRY_DISABLED=1` | Disable telemetry |
 | `RTK_HOOK_AUDIT=1` | Enable hook audit logging |
