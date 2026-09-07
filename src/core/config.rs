@@ -256,8 +256,9 @@ impl Config {
 }
 
 fn get_config_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    Ok(config_dir.join(RTK_DATA_DIR).join(CONFIG_TOML))
+    let config_dir =
+        super::constants::config_dir().unwrap_or_else(|| PathBuf::from(".").join(RTK_DATA_DIR));
+    Ok(config_dir.join(CONFIG_TOML))
 }
 
 pub fn show_config() -> Result<()> {
@@ -281,6 +282,25 @@ pub fn show_config() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The only test in this crate that sets `RTK_CONFIG_DIR`, so it needs no
+    /// lock; the variable is put back before asserting so a failure cannot
+    /// leak the override into other tests in the process.
+    #[test]
+    fn test_get_config_path_honours_rtk_config_dir() {
+        use crate::core::constants::RTK_CONFIG_DIR_ENV;
+
+        let dir = std::env::temp_dir().join("rtk_test_config_dir_env");
+        let previous = std::env::var_os(RTK_CONFIG_DIR_ENV);
+        std::env::set_var(RTK_CONFIG_DIR_ENV, &dir);
+        let overridden = get_config_path();
+        match previous {
+            Some(value) => std::env::set_var(RTK_CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(RTK_CONFIG_DIR_ENV),
+        }
+
+        assert_eq!(overridden.ok(), Some(dir.join(CONFIG_TOML)));
+    }
 
     #[test]
     fn test_hooks_config_deserialize() {

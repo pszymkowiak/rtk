@@ -345,8 +345,8 @@ fn build_meta_usage(tracker: &tracking::Tracker) -> serde_json::Value {
 
 /// Check if user has a config.toml file.
 fn detect_has_config() -> bool {
-    dirs::config_dir()
-        .map(|d| d.join("rtk/config.toml").exists())
+    crate::core::constants::config_dir()
+        .map(|d| d.join(crate::core::constants::CONFIG_TOML).exists())
         .unwrap_or(false)
 }
 
@@ -410,8 +410,8 @@ fn count_custom_toml_filters() -> usize {
     }
 
     // Global: ~/.config/rtk/filters/*.toml
-    if let Some(config_dir) = dirs::config_dir() {
-        if let Ok(entries) = std::fs::read_dir(config_dir.join("rtk/filters")) {
+    if let Some(config_dir) = crate::core::constants::config_dir() {
+        if let Ok(entries) = std::fs::read_dir(config_dir.join("filters")) {
             count += entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
