@@ -14,6 +14,8 @@ sidebar:
 | Linux | `~/.config/rtk/config.toml` |
 | macOS | `~/Library/Application Support/rtk/config.toml` |
 
+Set `RTK_CONFIG_DIR` to read `config.toml` and the global `filters.toml` from another directory instead; `rtk config` prints the path in effect.
+
 ```bash
 rtk config            # show current configuration
 rtk config --create   # create config file with defaults
@@ -83,6 +85,7 @@ since the agent must type `rtk` itself. `rtk init` prints a note when it does th
 | Variable | Description |
 |----------|-------------|
 | `RTK_DISABLED=1` | Disable RTK for a single command (`RTK_DISABLED=1 git status`) |
+| `RTK_CONFIG_DIR` | Override the config directory that holds `config.toml` and the global `filters.toml` (an empty value is ignored) |
 | `RTK_TEE_DIR` | Override the tee directory |
 | `RTK_TELEMETRY_DISABLED=1` | Disable telemetry |
 | `RTK_HOOK_AUDIT=1` | Enable hook audit logging |

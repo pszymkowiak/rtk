@@ -205,12 +205,8 @@ pub fn gated_filter_paths() -> Vec<PathBuf> {
 
 pub fn gated_filter_paths_labeled() -> Vec<(&'static str, PathBuf)> {
     let mut paths = vec![("project", PathBuf::from(".rtk/filters.toml"))];
-    if let Some(dir) = dirs::config_dir() {
-        paths.push((
-            "global",
-            dir.join(RTK_DATA_DIR)
-                .join(crate::core::constants::FILTERS_TOML),
-        ));
+    if let Some(dir) = crate::core::constants::config_dir() {
+        paths.push(("global", dir.join(crate::core::constants::FILTERS_TOML)));
     }
     paths
 }
