@@ -17,7 +17,14 @@ use std::io::Write;
 /// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
 pub fn run(cmd: &str) -> anyhow::Result<()> {
     let disabled_by_env = rewrite_disabled_by_env();
-    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
+    // A disabled invocation never consults the exclusions or transparent
+    // prefixes, so it does not read config.toml either: the passthrough costs
+    // one environment lookup and no file I/O.
+    let (excluded, transparent_prefixes) = if disabled_by_env {
+        Default::default()
+    } else {
+        crate::core::config::hook_rewrite_params()
+    };
 
     match evaluate(cmd, disabled_by_env, &excluded, &transparent_prefixes) {
         RewriteOutcome::Allow(rewritten) => {
