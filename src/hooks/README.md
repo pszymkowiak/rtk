@@ -74,7 +74,7 @@ Deny > Ask > Allow (explicit) > Default (ask)
 
 Rules are loaded from all Claude Code `settings.json` files (project + global, including `.local` variants). Only `Bash(...)` rules are extracted; other scopes (Read, Write) are ignored.
 
-Quoted `sh -c`, `bash -c`, and `zsh -c` scripts add a
+Quoted `sh -c`, `bash -c`, `zsh -c`, and `fish -c` scripts add a
 second command-parsing boundary. RTK checks deny rules against both the outer
 wrapper and the parsed inner segments. A wrapper rewrite is never auto-allowed:
 its strongest RTK verdict is `Ask`. Ask-capable hosts prompt, while other

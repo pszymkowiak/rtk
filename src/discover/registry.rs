@@ -6406,11 +6406,28 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_wrapper_leaves_fish_command_string_alone() {
+    fn test_shell_wrapper_rewrites_fish_portable_command_string() {
         assert_eq!(
             rewrite_command_no_prefixes("fish -c 'git status; cargo test'", &[]),
-            None
+            Some("fish -c 'rtk git status; rtk cargo test'".into())
         );
+    }
+
+    #[test]
+    fn test_shell_wrapper_defers_fish_specific_scripts() {
+        // `and` at a command boundary and bare `(…)` substitution are fish's own
+        // syntax; the shared lexer cannot attest either, so the wrapper defers.
+        for command in [
+            "fish -c 'git status; and cargo test'",
+            "fish -c 'git status (pwd)'",
+            "fish -c 'if test -d src; git status; end'",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "fish-specific script must pass through: {command:?}"
+            );
+        }
     }
 
     #[test]

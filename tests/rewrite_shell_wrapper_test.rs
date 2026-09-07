@@ -37,8 +37,20 @@ fn zsh_command_string_rewrites_inner_commands() {
 }
 
 #[test]
-fn fish_command_string_passes_through() {
+fn fish_command_string_rewrites_portable_inner_commands() {
     let output = rewrite("fish -c 'git status; cargo test'");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "fish -c 'rtk git status; rtk cargo test'"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn fish_specific_inner_script_passes_through() {
+    let output = rewrite("fish -c 'git status; and cargo test'");
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());

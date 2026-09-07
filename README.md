@@ -366,9 +366,10 @@ bash -c "head foo && grep -R bar ."
 ```
 
 This support is intentionally conservative: it covers exact `sh -c`,
-`bash -c`, and `zsh -c` wrappers with a quoted portable script. Shell expansion
-in an outer double quote, additional shell options, redirects to files, `fish`
-scripts, and nested wrappers pass through unchanged.
+`bash -c`, `zsh -c`, and `fish -c` wrappers with a quoted portable script.
+Shell expansion in an outer double quote, additional shell options, redirects
+to files, fish-specific syntax inside the script (`; and`, `if … end`, bare
+`(…)` substitution), and nested wrappers pass through unchanged.
 
 Unambiguously-fish scripts — multiline `if`/`for`/`switch` … `end` blocks or
 `; and` / `; or` chains — are the exception: instead of passing through to a

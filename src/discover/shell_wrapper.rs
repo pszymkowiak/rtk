@@ -1,9 +1,11 @@
 //! Parses the conservative subset of quoted shell -c wrappers that RTK can rewrite.
 
-/// POSIX-family shells only. `fish` needs a fish-aware lexer to attest its
-/// control keywords (`and`, `or`, `if`) at a command boundary, which the shared
-/// lexer does not model, so a fish script is never treated as rewritable.
-const SUPPORTED_SHELLS: &[&str] = &["sh", "bash", "zsh"];
+/// `fish` is supported alongside the POSIX family because the shared lexer
+/// attests fish's own constructs: bare `(…)` substitution and a control keyword
+/// (`and`, `or`, `if`, `end`, …) at a command boundary both make a script
+/// unattestable, so a fish script carrying control flow defers instead of being
+/// rewritten. Only portable inner commands are ever rewritten.
+const SUPPORTED_SHELLS: &[&str] = &["sh", "bash", "zsh", "fish"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShellWrapper {
@@ -159,8 +161,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_shell_wrapper_rejects_fish() {
-        assert_eq!(parsed_script("fish -c 'git status; cargo test'"), None);
+    fn test_parse_shell_wrapper_single_quoted_fish() {
+        assert_eq!(
+            parsed_script("fish -c 'git status; cargo test'"),
+            Some("git status; cargo test")
+        );
     }
 
     #[test]
@@ -270,6 +275,7 @@ mod tests {
             "bash -lc 'git status'",
             "bash -e -c 'git status'",
             "/bin/zsh -fc 'git status'",
+            "fish --command 'git status'",
         ] {
             assert!(
                 is_shell_wrapper_candidate(command),
@@ -280,7 +286,6 @@ mod tests {
             "bash script.sh",
             "python -c 'git status'",
             "bash -- script.sh",
-            "fish --command 'git status'",
         ] {
             assert!(
                 !is_shell_wrapper_candidate(command),
