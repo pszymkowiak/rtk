@@ -62,6 +62,18 @@ rtk gain    # should now show token savings stats
    cat ~/.claude/settings.json | grep rtk
    ```
 
+## `rtk test -d path` does not check for a directory
+
+**Cause:** `rtk test` runs test-runner commands and filters failures. It is not POSIX `test`.
+
+**Fix:**
+
+```bash
+rtk run "test -d path"
+# or
+test -d path
+```
+
 ## RTK not found after `cargo install`
 
 **Symptom:**
