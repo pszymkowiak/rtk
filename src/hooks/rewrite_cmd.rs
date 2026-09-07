@@ -12,13 +12,21 @@ use std::io::Write;
 /// | Exit | Stdout   | Meaning                                                      |
 /// |------|----------|--------------------------------------------------------------|
 /// | 0    | rewritten| Rewrite allowed — hook may auto-allow the rewritten command. |
-/// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
+/// | 1    | (none)   | No RTK equivalent, or `RTK_DISABLED=1` exported — hook passes through unchanged. |
 /// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
 /// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
 pub fn run(cmd: &str) -> anyhow::Result<()> {
-    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
+    let disabled_by_env = rewrite_disabled_by_env();
+    // A disabled invocation never consults the exclusions or transparent
+    // prefixes, so it does not read config.toml either: the passthrough costs
+    // one environment lookup and no file I/O.
+    let (excluded, transparent_prefixes) = if disabled_by_env {
+        Default::default()
+    } else {
+        crate::core::config::hook_rewrite_params()
+    };
 
-    match evaluate(cmd, &excluded, &transparent_prefixes) {
+    match evaluate(cmd, disabled_by_env, &excluded, &transparent_prefixes) {
         RewriteOutcome::Allow(rewritten) => {
             print!("{}", rewritten);
             let _ = std::io::stdout().flush();
@@ -42,7 +50,34 @@ enum RewriteOutcome {
     Ask(String),
 }
 
-fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> RewriteOutcome {
+/// `RTK_DISABLED=1` exported in the process environment (#1153, #3791).
+///
+/// The `RTK_DISABLED=1 <cmd>` prefix, handled per segment by the registry
+/// (#345), opts one command out; the exported form opts out every command the
+/// process sees, so a parent that sets it once stands the hook down for its
+/// whole process tree. Only the exact value `1` counts, like the other `RTK_*`
+/// switches, so a child can be re-enabled with `RTK_DISABLED=0`.
+fn rewrite_disabled_by_env() -> bool {
+    std::env::var("RTK_DISABLED").as_deref() == Ok("1")
+}
+
+/// Decide the outcome for `cmd`.
+///
+/// `disabled_by_env` is [`rewrite_disabled_by_env`], read once by the caller
+/// and passed in for the same reason the verdict is a parameter of
+/// [`evaluate_with_verdict`]: tests stay off the process-global environment.
+/// When set, the answer is a passthrough before the permission settings, the
+/// lexer, or the registry are consulted, so a disabled host never has its
+/// settings files read or a rewrite computed.
+fn evaluate(
+    cmd: &str,
+    disabled_by_env: bool,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+) -> RewriteOutcome {
+    if disabled_by_env {
+        return RewriteOutcome::Passthrough;
+    }
     evaluate_with_verdict(cmd, check_command(cmd), excluded, transparent_prefixes)
 }
 
@@ -199,6 +234,59 @@ mod tests {
                 evaluate_with_verdict("git status", PermissionVerdict::Default, &[], &[]),
                 RewriteOutcome::Ask(_)
             ));
+        }
+    }
+
+    /// `RTK_DISABLED=1` exported in the environment is a passthrough for every
+    /// command (#1153), decided before the permission settings are read:
+    /// `evaluate` never reaches `check_command` when the flag is set, so the
+    /// disabled cases are independent of the developer's own Claude Code
+    /// settings.
+    mod disabled_by_env {
+        use super::super::{evaluate, evaluate_with_verdict, RewriteOutcome};
+        use crate::hooks::permissions::PermissionVerdict;
+
+        #[test]
+        fn test_disabled_by_env_passes_through_rewritable_command() {
+            assert_eq!(
+                evaluate("git status", true, &[], &[]),
+                RewriteOutcome::Passthrough
+            );
+        }
+
+        #[test]
+        fn test_disabled_by_env_passes_through_already_rtk_command() {
+            assert_eq!(
+                evaluate("rtk git status", true, &[], &[]),
+                RewriteOutcome::Passthrough
+            );
+        }
+
+        /// With the flag off, `git status` still rewrites. Which of
+        /// `Allow`/`Ask`/`Deny` comes back depends on the developer's own
+        /// Claude Code settings (#3146); only `Passthrough` would mean the
+        /// flag leaked into the enabled path.
+        #[test]
+        fn test_enabled_env_still_rewrites() {
+            assert_ne!(
+                evaluate("git status", false, &[], &[]),
+                RewriteOutcome::Passthrough
+            );
+        }
+
+        /// The in-command prefix (#345) is unchanged: with the flag off it is
+        /// still the registry's decision.
+        #[test]
+        fn test_prefix_form_still_passes_through_without_env() {
+            assert_eq!(
+                evaluate_with_verdict(
+                    "RTK_DISABLED=1 git status",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[]
+                ),
+                RewriteOutcome::Passthrough
+            );
         }
     }
 

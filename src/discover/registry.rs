@@ -3008,8 +3008,13 @@ mod tests {
             }
         }
 
+        // The exported form of the variable is a passthrough before the
+        // registry runs (rewrite_cmd.rs), which would skip the warning under
+        // test here — so a developer's own `export RTK_DISABLED=1` must not
+        // reach the child.
         let output = std::process::Command::new(&rtk_bin)
             .args(["rewrite", "RTK_DISABLED=1 git status"])
+            .env_remove("RTK_DISABLED")
             .output()
             .expect("Failed to run rtk");
 
