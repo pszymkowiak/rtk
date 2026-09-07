@@ -304,7 +304,14 @@ pub fn run_trust(list: bool, yes: bool) -> Result<()> {
         if had_error {
             anyhow::bail!("Filter file present but not valid TOML — see the error above.");
         }
-        anyhow::bail!("No custom filters found (.rtk/filters.toml or ~/.config/rtk/filters.toml)");
+        let global = crate::core::constants::config_dir()
+            .map(|d| {
+                d.join(crate::core::constants::FILTERS_TOML)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "~/.config/rtk/filters.toml".to_string());
+        anyhow::bail!("No custom filters found (.rtk/filters.toml or {global})");
     }
     if !enabled_any {
         if !interactive {
@@ -482,7 +489,7 @@ mod tests {
     fn test_gated_filter_paths_covers_project_and_global() {
         let paths = gated_filter_paths();
         assert_eq!(paths[0], PathBuf::from(".rtk/filters.toml"));
-        if dirs::config_dir().is_some() {
+        if crate::core::constants::config_dir().is_some() {
             assert_eq!(paths.len(), 2);
             assert!(paths[1].ends_with("filters.toml"));
             assert!(paths[1].is_absolute());
