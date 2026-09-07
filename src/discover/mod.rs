@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use provider::{ClaudeProvider, SessionProvider};
 use registry::{
-    category_avg_tokens, classify_command, split_command_chain, strip_disabled_prefix,
-    Classification, ExcludePattern,
+    category_avg_tokens, classify_command, guess_unsupported_category, split_command_chain,
+    strip_disabled_prefix, Classification, ExcludePattern,
 };
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
 
@@ -556,15 +556,22 @@ pub fn run(
 
     let mut unsupported: Vec<UnsupportedEntry> = unsupported_map
         .into_iter()
-        .map(|(base, bucket)| UnsupportedEntry {
-            base_command: base,
-            count: bucket.count,
-            example: bucket.example,
+        .map(|(base, bucket)| {
+            let category = guess_unsupported_category(&base);
+            let avg_tokens = category_avg_tokens(category, &base);
+            UnsupportedEntry {
+                base_command: base,
+                count: bucket.count,
+                example: bucket.example,
+                estimated_impact_tokens: bucket.count * avg_tokens,
+            }
         })
         .collect();
 
-    // Sort by count descending
-    unsupported.sort_by_key(|b| std::cmp::Reverse(b.count));
+    // Sort by estimated impact (call_frequency x avg_output) descending, not
+    // raw count -- a rarely-called command with huge output can outrank a
+    // frequent tiny one.
+    unsupported.sort_by_key(|b| std::cmp::Reverse(b.estimated_impact_tokens));
 
     // Build RTK_DISABLED examples sorted by frequency (top 5)
     let rtk_disabled_examples: Vec<String> = {
