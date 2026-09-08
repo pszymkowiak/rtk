@@ -143,8 +143,10 @@ rewrite_compound(cmd, excluded)                    [src/discover/registry.rs]
   |
   |  Step 2 — Split on operators, rewrite each segment
   |  Operator (&&, ||, ;) → rewrite both sides
-  |  Pipe (|) → keep producers/intermediate stages raw
-  |             rewrite only a pipeline-safe final stage
+  |  Pipe (|) → keep intermediate stages raw
+  |             rewrite a pipeline-safe final stage, or the
+  |             producer when its rule allows it and all
+  |             consumers are display-only (#3171)
   |  Stderr pipe (|&) → keep the complete pipeline raw
   |  Shellism (&) → rewrite both sides (background)
   |
