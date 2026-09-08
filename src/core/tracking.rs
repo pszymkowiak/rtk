@@ -295,7 +295,6 @@ pub struct MonthStats {
     pub avg_time_ms: u64,
 }
 
-/// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
 /// Type alias for command statistics tuple: (command, count, saved_tokens, weighted_savings_rate, avg_time_ms)
 ///
 /// # Warning
@@ -2500,7 +2499,7 @@ mod tests {
         env::set_var("RTK_TRACK_CAP_CHARS", "30000");
 
         let db_path =
-            std::env::temp_dir().join(format!("rtk_test_migration_busy_{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("rtk_test_migration_fail_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db_path);
 
         let conn = Connection::open(&db_path).expect("open db");
@@ -2513,27 +2512,26 @@ mod tests {
             [],
         )
         .expect("seed pre-fix row");
-        // No WAL here (default rollback journal): an EXCLUSIVE transaction
-        // on a second connection blocks writers on the first outright,
-        // which busy_timeout(0) below turns into an immediate SQLITE_BUSY
-        // instead of a wait.
-        conn.busy_timeout(std::time::Duration::from_millis(0))
-            .expect("set busy_timeout");
 
-        let blocker = Connection::open(&db_path).expect("open second connection");
-        blocker
-            .execute_batch("BEGIN EXCLUSIVE")
-            .expect("acquire exclusive lock");
+        // Fail the retroactive cap UPDATE *specifically*. A lock on a second
+        // connection cannot do this: BEGIN EXCLUSIVE blocks readers too, so
+        // run_schema_migrations dies on its first statement and never reaches
+        // the UPDATE at all -- the assertion below would then pass even with
+        // the UPDATE's Result discarded. An ABORT trigger fails exactly the
+        // one statement under test and nothing else.
+        conn.execute_batch(
+            "CREATE TRIGGER rtk_test_block_cap_update BEFORE UPDATE OF input_tokens ON commands
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .expect("install blocking trigger");
 
-        let migration_result = run_schema_migrations(&conn);
-        assert!(
-            migration_result.is_err(),
-            "a migration UPDATE that hits SQLITE_BUSY must propagate the \
-             error, not silently swallow it and proceed as if it succeeded"
+        let err = run_schema_migrations(&conn)
+            .expect_err("a failing retroactive cap UPDATE must propagate, not be swallowed")
+            .to_string();
+        assert_eq!(
+            err, "retroactive token-cap migration (schema v2) failed",
+            "the propagated error must be the cap UPDATE's own"
         );
-
-        blocker.execute_batch("ROLLBACK").expect("release lock");
-        drop(blocker);
 
         let version_after_failure: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -2545,7 +2543,9 @@ mod tests {
              and the oversized historical row stays uncapped forever"
         );
 
-        // Confirm the retry actually works once the lock is gone.
+        // Confirm the retry actually works once the failure is gone.
+        conn.execute_batch("DROP TRIGGER rtk_test_block_cap_update")
+            .expect("drop trigger");
         run_schema_migrations(&conn).expect("retry succeeds");
         let input_after_retry: i64 = conn
             .query_row(

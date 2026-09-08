@@ -276,7 +276,6 @@ fn main() {{
         assert_eq!(baseline, "charlie\ndelta\n");
     }
 
-
     #[test]
     fn test_apply_line_window_tail_lines() {
         let input = "a\nb\nc\nd\n";
