@@ -64,14 +64,22 @@ pub fn run(
         );
     }
 
-    let (raw, rtk_output) =
-        prepare_outputs(&content, &filtered, max_lines, tail_lines, line_numbers, &lang);
+    filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
+
+    let (raw, rtk_output) = if line_numbers {
+        (
+            format_with_line_numbers(&content),
+            format_with_line_numbers(&filtered),
+        )
+    } else {
+        (content.clone(), filtered.clone())
+    };
     let shown = never_worse(&raw, &rtk_output);
     print!("{}", shown);
     timer.track(
         &format!("cat {}", file.display()),
         "rtk read",
-        &raw,
+        &tracking_baseline(&content, max_lines, tail_lines, line_numbers, &lang),
         shown,
     );
     Ok(())
@@ -124,12 +132,25 @@ pub fn run_stdin(
         );
     }
 
-    let (raw, rtk_output) =
-        prepare_outputs(&content, &filtered, max_lines, tail_lines, line_numbers, &lang);
+    let filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
+
+    let (raw, rtk_output) = if line_numbers {
+        (
+            format_with_line_numbers(&content),
+            format_with_line_numbers(&filtered),
+        )
+    } else {
+        (content.clone(), filtered.clone())
+    };
     let shown = never_worse(&raw, &rtk_output);
     print!("{}", shown);
 
-    timer.track("cat - (stdin)", "rtk read -", &raw, shown);
+    timer.track(
+        "cat - (stdin)",
+        "rtk read -",
+        &tracking_baseline(&content, max_lines, tail_lines, line_numbers, &lang),
+        shown,
+    );
     Ok(())
 }
 
@@ -143,32 +164,36 @@ fn format_with_line_numbers(content: &str) -> String {
     out
 }
 
-/// Build the (raw, rtk_output) pair `timer.track` compares, windowing BOTH
-/// sides by `--max-lines`/`--tail-lines` before the comparison -- not just
-/// the filtered side. Content dropped by an explicit user-requested window
-/// is the user choosing to see less, not RTK compressing anything; counting
-/// it as "saved tokens" credited a single `--max-lines` read on a large file
-/// with the entire un-shown remainder as a fake saving (see #2805/#1045: one
-/// bioinformatics file read alone reported 250M+ phantom saved tokens this
-/// way).
-fn prepare_outputs(
+/// The raw baseline `timer.track` compares against -- windowed by
+/// `--max-lines`/`--tail-lines` the same way the displayed/tracked output
+/// already is, so content outside an explicit window doesn't get counted as
+/// a fake "saving". Content the user asked NOT to see is the user choosing
+/// to see less, not RTK compressing anything; without this, a single
+/// `--max-lines` read on a large file credited RTK with the entire un-shown
+/// remainder as savings (see #2805/#1045: one bioinformatics file read alone
+/// reported 250M+ phantom saved tokens this way).
+///
+/// Deliberately SEPARATE from the `raw`/`shown` computation above: `raw` and
+/// `never_worse`'s fallback must keep comparing against the FULL, unwindowed
+/// content -- windowing the safety-net's own "raw" would compare two
+/// already-shrunk strings against each other and could flip `never_worse`
+/// into printing an unfiltered windowed excerpt instead of the real filtered
+/// output (caught in review: this function used to return that windowed
+/// value as `raw` itself, which fed straight into `print!`, not just
+/// tracking -- a real, silent change to program output, not just to what
+/// gets recorded).
+fn tracking_baseline(
     content: &str,
-    filtered: &str,
     max_lines: Option<usize>,
     tail_lines: Option<usize>,
     line_numbers: bool,
     lang: &Language,
-) -> (String, String) {
-    let raw_windowed = apply_line_window(content, max_lines, tail_lines, lang);
-    let filtered_windowed = apply_line_window(filtered, max_lines, tail_lines, lang);
-
+) -> String {
+    let windowed = apply_line_window(content, max_lines, tail_lines, lang);
     if line_numbers {
-        (
-            format_with_line_numbers(&raw_windowed),
-            format_with_line_numbers(&filtered_windowed),
-        )
+        format_with_line_numbers(&windowed)
     } else {
-        (raw_windowed, filtered_windowed)
+        windowed
     }
 }
 
@@ -233,43 +258,24 @@ fn main() {{
     // "saving" -- a single large file read this way reported 250M+ phantom
     // saved tokens in the wild.
     #[test]
-    fn test_prepare_outputs_max_lines_windows_tracking_baseline() {
+    fn test_tracking_baseline_max_lines_windows_the_raw_side() {
         let input = "alpha\nbravo\ncharlie\ndelta\n";
-        let (raw, rtk_output) =
-            prepare_outputs(input, input, Some(2), None, false, &Language::Unknown);
+        let baseline = tracking_baseline(input, Some(2), None, false, &Language::Unknown);
 
-        // Both sides windowed identically -> no phantom savings.
-        assert_eq!(raw, rtk_output);
-        assert!(raw.starts_with("alpha\n"));
-        assert!(raw.contains("more lines"));
-        assert!(!raw.contains("bravo"));
-        assert!(!raw.contains("charlie"));
+        assert!(baseline.starts_with("alpha\n"));
+        assert!(baseline.contains("more lines"));
+        assert!(!baseline.contains("bravo"));
+        assert!(!baseline.contains("charlie"));
     }
 
     #[test]
-    fn test_prepare_outputs_tail_lines_windows_tracking_baseline() {
+    fn test_tracking_baseline_tail_lines_windows_the_raw_side() {
         let input = "alpha\nbravo\ncharlie\ndelta\n";
-        let (raw, rtk_output) =
-            prepare_outputs(input, input, None, Some(2), false, &Language::Unknown);
+        let baseline = tracking_baseline(input, None, Some(2), false, &Language::Unknown);
 
-        assert_eq!(raw, "charlie\ndelta\n");
-        assert_eq!(rtk_output, raw);
+        assert_eq!(baseline, "charlie\ndelta\n");
     }
 
-    #[test]
-    fn test_prepare_outputs_real_filter_savings_still_counted_inside_window() {
-        // The window must not hide genuine filter savings -- only content
-        // OUTSIDE the window should stop counting.
-        let content = "keep me\n// comment\nkeep me too\nmore content\nfinal line\n";
-        let filtered = "keep me\nkeep me too\nmore content\nfinal line\n"; // comment stripped
-        let (raw, rtk_output) =
-            prepare_outputs(content, filtered, Some(2), None, false, &Language::Unknown);
-
-        assert_ne!(
-            raw, rtk_output,
-            "a real filter difference inside the window must still show up"
-        );
-    }
 
     #[test]
     fn test_apply_line_window_tail_lines() {
@@ -341,6 +347,44 @@ fn main() {{
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stdout.contains("valid content"), "valid file should still be printed");
         assert!(stderr.contains("rtk_nonexistent_file"), "should report missing file on stderr");
+    }
+
+    // Regression test for a bug caught in review of the tracking_baseline
+    // fix: an earlier version computed a single windowed "raw" value and fed
+    // it into BOTH the tracking comparison AND the actual printed output
+    // (never_worse/print!) -- silently changing what the user sees, not just
+    // what gets tracked. With --max-lines combined with real filtering
+    // (minimal level strips the comment), the printed output must still be
+    // the real filtered content, never a raw/unfiltered windowed excerpt.
+    #[test]
+    #[ignore]
+    fn test_max_lines_does_not_leak_unfiltered_raw_into_printed_output() {
+        let bin = rtk_bin();
+        assert!(bin.exists(), "Run `cargo build` first");
+
+        let mut f = NamedTempFile::with_suffix(".rs").unwrap();
+        writeln!(f, "short").unwrap();
+        writeln!(f, "// a comment that minimal filtering should strip").unwrap();
+        writeln!(f, "a_very_long_real_code_line_that_should_still_print();").unwrap();
+
+        let output = std::process::Command::new(&bin)
+            .args([
+                "read",
+                &f.path().to_string_lossy(),
+                "--level",
+                "minimal",
+                "--max-lines",
+                "2",
+            ])
+            .output()
+            .expect("failed to run rtk read");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("// a comment"),
+            "the comment must be filtered out, not leak in via an unwindowed-raw fallback: {stdout:?}"
+        );
     }
 
     #[test]
