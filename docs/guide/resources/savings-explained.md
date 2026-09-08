@@ -64,6 +64,8 @@ The consequence is worth understanding:
 
 If you need exact counts, run the raw and filtered output through your model's own tokenizer.
 
+Estimates are also capped at `tracking.estimate_cap_chars` (default 30,000 — a conservative upper bound, 0 = uncapped; override with `RTK_TRACK_CAP_CHARS`). Coding-agent shells commonly truncate captured command output at or below that point, so counting tokens past it would count "savings" no model ever actually saw — without the cap, a single oversized `rtk read` on a huge file could otherwise dominate the entire lifetime total by orders of magnitude.
+
 ## How to read `rtk gain`
 
 | Column | What it actually is |
