@@ -32,12 +32,12 @@ keep_lines_matching = [
   "^\\s*Commit:",
   "^\\s*Author:",
   "^\\s*Fingerprint:",
+  "^\\s*(?:ERRO|ERROR|FATAL|WARN|WARNING)\\b",
   "^\\s*No (leaks|secrets) found",
   "^\\s*\\d+ (?:leaks?|findings?) found",
   "^\\s*Found \\d+ (?:leaks?|findings?)",
 ]
 max_lines = 120
-on_empty = "gitleaks: clean"
 
 [[tests.gitleaks]]
 name = "dir scan keeps finding essentials and dir-mode file location"
@@ -60,7 +60,7 @@ Entropy:      3.92
 File:        server/.env
 Line:        8
 Fingerprint:  c3b4a8a1d0e7f7c2d5f6d8a9b2f3c4d5e6f70809a:server/.env:stripe-access-token:8
-0 leaks found
+2 leaks found
 """
 expected = """Finding: API_KEY=************************
 RuleID: generic-api-key
@@ -76,7 +76,7 @@ Entropy: 3.92
 File: server/.env
 Line: 8
 Fingerprint: c3b4a8a1d0e7f7c2d5f6d8a9b2f3c4d5e6f70809a:server/.env:stripe-access-token:8
-0 leaks found"""
+2 leaks found"""
 
 [[tests.gitleaks]]
 name = "git scan keeps commit and author with concise finding fields"
@@ -115,3 +115,8 @@ INFO[0000] scanning target .
 No secrets found
 """
 expected = "No secrets found"
+
+[[tests.gitleaks]]
+name = "unexpected diagnostics are preserved instead of reported clean"
+input = "ERRO[0000] failed to load config"
+expected = "ERRO[0000] failed to load config"
