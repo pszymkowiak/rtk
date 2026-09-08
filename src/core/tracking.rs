@@ -298,6 +298,14 @@ pub struct MonthStats {
 }
 
 /// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
+/// Type alias for command statistics tuple: (command, count, saved_tokens, weighted_savings_rate, avg_time_ms)
+///
+/// # Warning
+/// The 4th field is a **weighted** savings rate: `SUM(saved_tokens) * 100.0 / SUM(input_tokens)`.
+/// Do NOT aggregate this column with `AVG()` -- that produces an unweighted mean that
+/// under-weights high-volume commands (a command with thousands of near-0%-savings
+/// calls and a handful of near-100% ones can show an average nowhere near either real
+/// figure). Always derive it as `SUM(saved) / SUM(input)`.
 type CommandStats = (String, usize, usize, f64, u64);
 
 /// Current tracking-DB schema version, stored in the SQLite `user_version` pragma.
@@ -923,7 +931,9 @@ impl Tracker {
     ) -> Result<Vec<CommandStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens),
+                    CASE WHEN SUM(input_tokens) > 0 THEN SUM(saved_tokens) * 100.0 / SUM(input_tokens) ELSE 0.0 END,
+                    AVG(exec_time_ms)
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
              GROUP BY rtk_cmd
@@ -2340,6 +2350,65 @@ mod tests {
         assert_eq!(after_first, after_second);
 
         env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6j. get_by_command uses a weighted savings rate, not an unweighted
+    // average -- regression test for AVG(savings_pct) giving misleading
+    // results when many small, near-0%-savings invocations dilute the
+    // average of a high-volume command (see the write-up in this fix: a
+    // real install showed a 5.3% average for `rtk read` while the SUM of
+    // saved_tokens for that same command was 138.9M, entirely because 4,627
+    // of 5,180 calls genuinely saved 0% and 158 outliers supplied 99.86% of
+    // the total -- the unweighted AVG buried that skew completely).
+    //
+    // Setup: one small call (10% savings) + one large call (95% savings).
+    // Unweighted avg would read ~52.5%. The weighted rate must read ~95%.
+    #[test]
+    fn test_get_by_command_weighted_savings_rate() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let cmd_name = "weighted_test_cmd";
+
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, ?2, ?2, '', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    cmd_name,
+                    100_i64, 90_i64, 10_i64, 10.0_f64, 5_i64
+                ],
+            )
+            .expect("insert small invocation");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, ?2, ?2, '', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    cmd_name,
+                    100_000_i64, 5_000_i64, 95_000_i64, 95.0_f64, 10_i64
+                ],
+            )
+            .expect("insert large invocation");
+
+        let by_cmd = tracker
+            .get_by_command(None)
+            .expect("Failed to get by_command stats");
+        let (_name, _count, _saved, rate, _time) = by_cmd
+            .iter()
+            .find(|(name, ..)| name == cmd_name)
+            .expect("test command not found in by_command stats");
+
+        // Weighted rate = (10 + 95,000) * 100.0 / (100 + 100,000) ~= 94.99%.
+        // Unweighted avg would be (10.0 + 95.0) / 2 = 52.5% -- the gap proves
+        // the fix works.
+        assert!(
+            *rate > 90.0,
+            "expected weighted rate >90%, got {:.1}% -- unweighted avg would be ~52.5%",
+            rate
+        );
     }
 
     // 7. get_db_path respects environment variable RTK_DB_PATH
