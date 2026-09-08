@@ -295,7 +295,14 @@ pub struct MonthStats {
     pub avg_time_ms: u64,
 }
 
-/// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
+/// Type alias for command statistics tuple: (command, count, saved_tokens, weighted_savings_rate, avg_time_ms)
+///
+/// # Warning
+/// The 4th field is a **weighted** savings rate: `SUM(saved_tokens) * 100.0 / SUM(input_tokens)`.
+/// Do NOT aggregate this column with `AVG()` -- that produces an unweighted mean that
+/// under-weights high-volume commands (a command with thousands of near-0%-savings
+/// calls and a handful of near-100% ones can show an average nowhere near either real
+/// figure). Always derive it as `SUM(saved) / SUM(input)`.
 type CommandStats = (String, usize, usize, f64, u64);
 
 /// Current tracking-DB schema version, stored in the SQLite `user_version` pragma.
@@ -305,7 +312,15 @@ type CommandStats = (String, usize, usize, f64, u64);
 /// call. Bump this whenever `run_schema_migrations` gains a new statement; a stale
 /// `user_version` triggers exactly one re-run of the full migration sequence, then
 /// the pragma is updated so subsequent opens skip straight past it.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+/// The version the retroactive token-cap migration (see `run_schema_migrations`)
+/// was introduced at. Checked directly against the on-disk `user_version`
+/// rather than assumed from `SCHEMA_VERSION`, so this one-time data
+/// migration can't be silently re-triggered by a future schema bump that
+/// re-runs `run_schema_migrations` for an unrelated reason, nor by
+/// `MigrationMode::Always` (`rtk init`'s self-heal path) re-invoking the
+/// whole function on an already-migrated DB.
+const TOKEN_CAP_MIGRATION_VERSION: i64 = 2;
 
 /// Create all tables/indexes, run column migrations, and stamp `user_version` to
 /// `SCHEMA_VERSION` for the on-disk tracker DB.
@@ -400,6 +415,78 @@ fn run_schema_migrations(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
         [],
     )?;
+
+    // One-time migration (schema v2): retroactively cap historical rows at
+    // the same ceiling `TimedExecution::track` now enforces at write time.
+    // Before this, an uncapped `rtk read` on an oversized file could record
+    // input_tokens in the tens of millions (real case: a single row recorded
+    // ~135.7M input tokens against a 21-token output, a ~136M-token phantom
+    // "saving" for content no agent shell would ever have held in context).
+    // `input_tokens`/`output_tokens` are capped first, then `saved_tokens`/
+    // `savings_pct` are recomputed from the CAPPED values (not the original
+    // saturating_sub result) so a row that was a genuine regression before
+    // capping (output > input) can't be capped into a fake positive saving —
+    // the MAX(..., 0) floor lands on 0 in that case, same as an uncapped
+    // regression already does.
+    //
+    // Two correctness requirements caught in review, both handled by the
+    // `current_version < TOKEN_CAP_MIGRATION_VERSION` guard below rather than
+    // relying on the caller:
+    //
+    // 1. Genuinely one-time, not just "not on the hot path". `rtk init`
+    //    calls `ensure_schema_fresh()` -> `MigrationMode::Always`, which
+    //    deliberately re-invokes this whole function unconditionally (to
+    //    self-heal a table dropped out-of-band) -- table/column
+    //    creation is safe to always re-run (CREATE TABLE IF NOT EXISTS /
+    //    ADD COLUMN are no-ops once present), but this UPDATE is not: if a
+    //    user lowers RTK_TRACK_CAP_CHARS/estimate_cap_chars and then runs
+    //    `rtk init` again (an ordinary repair action), an unconditional
+    //    re-run would silently re-cap -- and permanently lose, with no
+    //    backup -- legitimate historical data that was already correctly
+    //    under the OLD cap. Reading the on-disk version directly (instead
+    //    of trusting the caller's migration mode) makes this immune to
+    //    which path invoked `run_schema_migrations`.
+    // 2. Must not get silently marked "done" on a failed write. The old
+    //    version discarded the UPDATE's Result via `let _ =`, then
+    //    unconditionally stamped `user_version` right after -- so a
+    //    transient failure (SQLITE_BUSY past the busy_timeout under a
+    //    concurrent rtk/hook process, disk pressure, a read-only mount)
+    //    would permanently mark the DB as migrated while the oversized
+    //    historical rows -- the exact ones this migration exists to fix --
+    //    stayed uncapped forever, with no error surfaced anywhere. Now
+    //    propagated with `?`: on failure, `run_schema_migrations` returns
+    //    Err, the pragma update below never runs, `user_version` stays
+    //    stale, and the retroactive cap retries on the next `Tracker::new()`
+    //    (silently no-op-ing tracking for just that one invocation, the
+    //    same fallback every other schema-migration failure already causes
+    //    via the `if let Ok(tracker) = Tracker::new()` pattern call sites use).
+    let current_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if current_version < TOKEN_CAP_MIGRATION_VERSION {
+        // `usize::MAX` (cap disabled, RTK_TRACK_CAP_CHARS=0) can't round-trip
+        // through `as i64` without wrapping to -1, which would clamp every
+        // row to -1 instead of skipping the migration -- guard explicitly.
+        let cap = max_tracked_tokens();
+        if cap != usize::MAX {
+            let cap = cap as i64;
+            conn.execute(
+                "UPDATE commands
+                 SET input_tokens = MIN(input_tokens, ?1),
+                     output_tokens = MIN(output_tokens, ?1),
+                     saved_tokens = MAX(MIN(input_tokens, ?1) - MIN(output_tokens, ?1), 0),
+                     savings_pct = CASE
+                         WHEN MIN(input_tokens, ?1) > 0
+                         THEN (CAST(MAX(MIN(input_tokens, ?1) - MIN(output_tokens, ?1), 0) AS REAL)
+                               / MIN(input_tokens, ?1)) * 100.0
+                         ELSE 0.0
+                     END
+                 WHERE input_tokens > ?1 OR output_tokens > ?1",
+                params![cap],
+            )
+            .context("retroactive token-cap migration (schema v2) failed")?;
+        }
+    }
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
@@ -886,7 +973,9 @@ impl Tracker {
     ) -> Result<Vec<CommandStats>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens),
+                    CASE WHEN SUM(input_tokens) > 0 THEN SUM(saved_tokens) * 100.0 / SUM(input_tokens) ELSE 0.0 END,
+                    AVG(exec_time_ms)
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
              GROUP BY rtk_cmd
@@ -1301,8 +1390,17 @@ impl Tracker {
 
     /// Count commands with low savings (<30%) — filters that need improvement.
     pub fn low_savings_commands(&self, limit: usize) -> Result<Vec<(String, f64)>> {
+        // Weighted rate (SUM(saved)/SUM(input)), not AVG(savings_pct) --
+        // same fix as get_by_command, for the same reason: an unweighted
+        // per-call average lets a high-volume command's real performance be
+        // buried by many small, near-0%-savings calls (or inflated by a few
+        // near-100% outliers among many genuine 0%s), which would make this
+        // telemetry signal mis-flag (or fail to flag) commands purely from
+        // the statistical artifact, not their real weighted performance.
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, AVG(savings_pct) as avg_sav FROM commands
+            "SELECT rtk_cmd,
+                    CASE WHEN SUM(input_tokens) > 0 THEN SUM(saved_tokens) * 100.0 / SUM(input_tokens) ELSE 0.0 END AS avg_sav
+             FROM commands
              WHERE input_tokens > 0
              GROUP BY rtk_cmd
              HAVING avg_sav < 30.0 AND avg_sav > 0.0
@@ -1659,6 +1757,51 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.len() as f64 / 4.0).ceil() as usize
 }
 
+/// Char ceiling for tracked token estimates. `RTK_TRACK_CAP_CHARS` (if set and
+/// parseable) wins over `tracking.estimate_cap_chars` in config.toml, which
+/// falls back to `DEFAULT_ESTIMATE_CAP_CHARS` if config can't be loaded.
+///
+/// The env var is re-read on every call (cheap). The config-derived fallback
+/// is resolved once per process and cached in a `OnceLock` — `Config::load()`
+/// only ever runs on the first call that has no env override. Tests that
+/// exercise the fallback path can silently inherit whatever an earlier test
+/// in the same process cached; set `RTK_TRACK_CAP_CHARS` explicitly instead
+/// of relying on the fallback.
+fn estimate_cap_chars() -> usize {
+    if let Some(chars) = std::env::var("RTK_TRACK_CAP_CHARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return chars;
+    }
+    // Malformed RTK_TRACK_CAP_CHARS (non-numeric, negative) falls through to
+    // the config/default cap below, silently — the hook path must stay quiet.
+    // Reuses the crate's single process-wide config cache (`cached_config`)
+    // instead of a second private `Config::load()` -- an earlier version had
+    // its own OnceLock here, which meant every rtk invocation that hits this
+    // (i.e. every one, via TimedExecution::track) read and TOML-parsed
+    // config.toml a second time on top of the read `get_db_path()` already
+    // does via the same cache, on a path documented as latency-sensitive
+    // (every rtk invocation and every PreToolUse hook call).
+    crate::core::config::cached_config()
+        .tracking
+        .estimate_cap_chars
+}
+
+/// Token ceiling derived from `estimate_cap_chars()` (ceil(chars/4), same
+/// rounding as `estimate_tokens`). Many coding-agent shells truncate captured
+/// command output around this many characters, so estimating tokens past it
+/// counts savings that never reached any model context. A cap of `0` chars
+/// disables clamping entirely.
+fn max_tracked_tokens() -> usize {
+    let chars = estimate_cap_chars();
+    if chars == 0 {
+        usize::MAX
+    } else {
+        (chars as f64 / 4.0).ceil() as usize
+    }
+}
+
 /// Helper struct for timing command execution
 /// Helper for timing command execution and tracking results.
 ///
@@ -1728,8 +1871,9 @@ impl TimedExecution {
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        let input_tokens = estimate_tokens(input);
-        let output_tokens = estimate_tokens(output);
+        let cap = max_tracked_tokens();
+        let input_tokens = estimate_tokens(input).min(cap);
+        let output_tokens = estimate_tokens(output).min(cap);
 
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(
@@ -1962,6 +2106,562 @@ mod tests {
         env::remove_var("RTK_DB_PATH");
         // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6b. TimedExecution::track clamps oversized input before it reaches
+    // record() — raw text far past the cap must not inflate input_tokens.
+    // `estimate_cap_chars()`'s config-fallback is cached process-wide in a
+    // OnceLock, so every test here sets RTK_TRACK_CAP_CHARS explicitly
+    // rather than relying on the fallback (see that function's doc comment).
+    #[test]
+    fn test_timed_execution_track_clamps_oversized_input() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let db_path =
+            env::temp_dir().join(format!("rtk_test_clamp_input_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        env::set_var("RTK_DB_PATH", &db_path);
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000");
+
+        let timer = TimedExecution::start();
+        let cmd = format!("rtk clamp_input_test_{}", std::process::id());
+        let raw = "a".repeat(130_000); // far past the 30,000-char cap
+
+        timer.track("cat huge.log", &cmd, &raw, "short output");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let input_tokens: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = ?1",
+                params![cmd],
+                |r| r.get(0),
+            )
+            .expect("record not found");
+        assert_eq!(input_tokens, 7_500, "30,000 chars / 4 = 7,500 tokens");
+
+        drop(tracker);
+        env::remove_var("RTK_DB_PATH");
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6c. Same clamp applies to output tokens, not just input.
+    #[test]
+    fn test_timed_execution_track_clamps_oversized_output() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let db_path =
+            env::temp_dir().join(format!("rtk_test_clamp_output_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        env::set_var("RTK_DB_PATH", &db_path);
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000");
+
+        let timer = TimedExecution::start();
+        let cmd = format!("rtk clamp_output_test_{}", std::process::id());
+        let huge_output = "b".repeat(130_000);
+
+        timer.track("cmd", &cmd, "small input", &huge_output);
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let output_tokens: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT output_tokens FROM commands WHERE rtk_cmd = ?1",
+                params![cmd],
+                |r| r.get(0),
+            )
+            .expect("record not found");
+        assert_eq!(output_tokens, 7_500);
+
+        drop(tracker);
+        env::remove_var("RTK_DB_PATH");
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6d. RTK_TRACK_CAP_CHARS overrides the default truncation ceiling.
+    #[test]
+    fn test_timed_execution_track_respects_cap_chars_override() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let db_path =
+            env::temp_dir().join(format!("rtk_test_cap_override_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        env::set_var("RTK_DB_PATH", &db_path);
+        env::set_var("RTK_TRACK_CAP_CHARS", "40"); // 40 chars -> 10 tokens
+
+        let timer = TimedExecution::start();
+        let cmd = format!("rtk cap_override_test_{}", std::process::id());
+        timer.track("cmd", &cmd, &"e".repeat(1000), "short");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let input_tokens: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = ?1",
+                params![cmd],
+                |r| r.get(0),
+            )
+            .expect("record not found");
+        assert_eq!(input_tokens, 10);
+
+        drop(tracker);
+        env::remove_var("RTK_DB_PATH");
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6e. RTK_TRACK_CAP_CHARS=0 disables the cap entirely.
+    #[test]
+    fn test_timed_execution_track_cap_zero_disables_clamp() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let db_path =
+            env::temp_dir().join(format!("rtk_test_cap_disabled_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        env::set_var("RTK_DB_PATH", &db_path);
+        env::set_var("RTK_TRACK_CAP_CHARS", "0");
+
+        let timer = TimedExecution::start();
+        let cmd = format!("rtk cap_disabled_test_{}", std::process::id());
+        let raw = "f".repeat(130_000);
+        timer.track("cmd", &cmd, &raw, "short");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let input_tokens: i64 = tracker
+            .conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = ?1",
+                params![cmd],
+                |r| r.get(0),
+            )
+            .expect("record not found");
+        assert_eq!(input_tokens, 32_500, "130,000 / 4, uncapped");
+
+        drop(tracker);
+        env::remove_var("RTK_DB_PATH");
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6f. Retroactive migration (schema v2): a row written by an OLDER rtk
+    // build (before this fix existed, so it bypassed the write-time clamp
+    // entirely) gets capped the next time the DB is opened, not left
+    // inflated forever.
+    #[test]
+    fn test_migration_caps_historical_oversized_rows() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000"); // -> 7,500 token cap
+
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_schema_migrations(&conn).expect("initial schema");
+        // Roll the version back to simulate a real pre-upgrade DB: tables
+        // already exist (from a much older version), but the schema v2
+        // token-cap migration hasn't run yet. Without this, the migration
+        // would correctly see itself as already-applied (version stamped by
+        // the call above) and skip -- exactly the one-time guarantee this
+        // fix relies on, but not what we're testing here.
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+
+        // Simulate a pre-fix row: input far past the cap, small real output.
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-01-01T00:00:00Z', 'cat huge.log', 'rtk read huge.log', 500000, 30, 499970, 99.994)",
+            [],
+        )
+        .expect("seed pre-fix row");
+
+        // Re-running migrations is exactly what happens the next time this
+        // DB is opened with a binary that includes the schema v2 migration.
+        run_schema_migrations(&conn).expect("re-run migrations");
+
+        let (input, output, saved, pct): (i64, i64, i64, f64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, saved_tokens, savings_pct FROM commands
+                 WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row still present");
+        assert_eq!(input, 7_500, "input capped down from 500,000");
+        assert_eq!(output, 30, "output was already under the cap");
+        assert_eq!(saved, 7_470, "recomputed from the capped input");
+        assert!((pct - 99.6).abs() < 0.1);
+
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6g. Regression test for the real bug this fix addresses: replaying the
+    // exact real-world row that motivated it (a single `rtk read` call
+    // recorded ~135.7M input tokens against a 21-token output -- one row
+    // alone accounting for ~92% of a user's entire lifetime "tokens saved"
+    // figure). After migration this must land at the cap, not anywhere near
+    // its original magnitude.
+    #[test]
+    fn test_migration_fixes_the_135m_token_phantom_row() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000");
+
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_schema_migrations(&conn).expect("initial schema");
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-07-24T14:15:33Z', 'cat huge.bin', 'rtk read', 135722224, 21, 135722203, 99.9999845272208)",
+            [],
+        )
+        .expect("seed the real repro row");
+
+        run_schema_migrations(&conn).expect("migrate");
+
+        let saved: i64 = conn
+            .query_row(
+                "SELECT saved_tokens FROM commands WHERE original_cmd = 'cat huge.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row present");
+        assert!(
+            saved <= 7_500,
+            "a single row must never again be able to claim more than the \
+             configured cap in \"saved tokens\" -- got {saved}"
+        );
+        assert_eq!(saved, 7_479); // 7,500 (capped input) - 21 (real output)
+
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6h. A row that was ALREADY a regression pre-cap (output > input, so the
+    // original saturating_sub already floored it to 0) must not be capped
+    // INTO a fake positive saving just because one side also exceeds the
+    // cap. Both sides collapsing to the same ceiling must floor at 0, not
+    // manufacture a new "savings" figure that never existed.
+    #[test]
+    fn test_migration_does_not_manufacture_savings_for_a_regression() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000"); // -> 7,500 token cap
+
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_schema_migrations(&conn).expect("initial schema");
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+        // input=5,000 (under cap), output=8,000 (over cap) -- a real
+        // regression (RTK's own output was bigger than the input).
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-01-01T00:00:00Z', 'ls -R src', 'rtk ls -R src', 5000, 8000, 0, 0.0)",
+            [],
+        )
+        .expect("seed regression row");
+
+        run_schema_migrations(&conn).expect("migrate");
+
+        let (saved, pct): (i64, f64) = conn
+            .query_row(
+                "SELECT saved_tokens, savings_pct FROM commands WHERE rtk_cmd = 'rtk ls -R src'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row present");
+        assert_eq!(
+            saved, 0,
+            "capping must not turn a regression into a fake saving"
+        );
+        assert_eq!(pct, 0.0);
+
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6i. Migration is idempotent: running it a second time on an
+    // already-capped DB (the normal case -- every subsequent `rtk` invocation
+    // after the first migrated open) must not change anything further.
+    #[test]
+    fn test_migration_is_idempotent() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000");
+
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_schema_migrations(&conn).expect("initial schema");
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-01-01T00:00:00Z', 'cat huge.log', 'rtk read huge.log', 500000, 30, 499970, 99.994)",
+            [],
+        )
+        .expect("seed pre-fix row");
+
+        run_schema_migrations(&conn).expect("first migration");
+        let after_first: (i64, i64, i64, f64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, saved_tokens, savings_pct FROM commands WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row present");
+
+        run_schema_migrations(&conn).expect("second migration");
+        let after_second: (i64, i64, i64, f64) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, saved_tokens, savings_pct FROM commands WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row present");
+
+        assert_eq!(after_first, after_second);
+
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6i-b. Regression test for a real HIGH-severity bug caught in review:
+    // `rtk init` -> `ensure_schema_fresh()` -> `MigrationMode::Always`
+    // deliberately re-invokes run_schema_migrations unconditionally (to
+    // self-heal a table dropped out-of-band) -- but before the
+    // TOKEN_CAP_MIGRATION_VERSION guard, that also re-ran the retroactive
+    // cap UPDATE every time, with whatever cap was CURRENTLY configured. A
+    // user lowering RTK_TRACK_CAP_CHARS and then running `rtk init` again
+    // (an ordinary repair action) would silently and irreversibly re-cap --
+    // and lose, with no backup -- legitimate historical data that was
+    // already correctly under the OLD cap.
+    #[test]
+    fn test_repeated_always_mode_migration_does_not_recap_with_a_new_lower_cap() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000"); // -> 7,500 token cap
+
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_schema_migrations(&conn).expect("initial schema");
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-01-01T00:00:00Z', 'cat huge.log', 'rtk read huge.log', 500000, 30, 499970, 99.994)",
+            [],
+        )
+        .expect("seed pre-fix row");
+
+        // First real migration (simulating the upgrade): caps at 7,500.
+        run_schema_migrations(&conn).expect("first migration");
+        let after_first: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row present");
+        assert_eq!(after_first, 7_500);
+
+        // Simulate `rtk init` re-running with a NEW, smaller cap (a normal
+        // repair action after the user changed their config). This must NOT
+        // re-touch a row that's already been migrated once, even though
+        // run_schema_migrations() itself is unconditionally re-invoked --
+        // exactly what MigrationMode::Always does.
+        env::set_var("RTK_TRACK_CAP_CHARS", "400"); // -> 100 token cap
+        run_schema_migrations(&conn).expect("rtk init re-run");
+        let after_init: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row present");
+        assert_eq!(
+            after_init, 7_500,
+            "an already-migrated row must not be re-capped to a new, lower \
+             ceiling just because run_schema_migrations was invoked again -- \
+             that's real user data, not a phantom-inflation row"
+        );
+
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+    }
+
+    // 6i-c. Regression test for the other HIGH-severity bug caught in
+    // review: the old code discarded the retroactive-cap UPDATE's Result
+    // via `let _ =`, then unconditionally stamped `user_version` right
+    // after -- so a failed UPDATE (lock contention, disk pressure, any I/O
+    // error) permanently marked the DB as migrated while the oversized rows
+    // stayed uncapped forever, with no error and no retry. Forces a real
+    // SQLITE_BUSY via a second connection holding an exclusive lock, and
+    // asserts the migration now (a) returns Err instead of swallowing it,
+    // and (b) leaves user_version un-bumped so the next attempt retries.
+    #[test]
+    fn test_migration_failure_does_not_silently_mark_the_db_as_migrated() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("RTK_TRACK_CAP_CHARS", "30000");
+
+        let db_path =
+            std::env::temp_dir().join(format!("rtk_test_migration_fail_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        let conn = Connection::open(&db_path).expect("open db");
+        run_schema_migrations(&conn).expect("initial schema");
+        conn.pragma_update(None, "user_version", 1_i64)
+            .expect("reset version for test");
+        conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct)
+             VALUES ('2026-01-01T00:00:00Z', 'cat huge.log', 'rtk read huge.log', 500000, 30, 499970, 99.994)",
+            [],
+        )
+        .expect("seed pre-fix row");
+
+        // Fail the retroactive cap UPDATE *specifically*. A lock on a second
+        // connection cannot do this: BEGIN EXCLUSIVE blocks readers too, so
+        // run_schema_migrations dies on its first statement and never reaches
+        // the UPDATE at all -- the assertion below would then pass even with
+        // the UPDATE's Result discarded. An ABORT trigger fails exactly the
+        // one statement under test and nothing else.
+        conn.execute_batch(
+            "CREATE TRIGGER rtk_test_block_cap_update BEFORE UPDATE OF input_tokens ON commands
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .expect("install blocking trigger");
+
+        let err = run_schema_migrations(&conn)
+            .expect_err("a failing retroactive cap UPDATE must propagate, not be swallowed")
+            .to_string();
+        assert_eq!(
+            err, "retroactive token-cap migration (schema v2) failed",
+            "the propagated error must be the cap UPDATE's own"
+        );
+
+        let version_after_failure: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("read version");
+        assert_eq!(
+            version_after_failure, 1,
+            "user_version must NOT advance past a failed migration -- \
+             otherwise the retroactive cap never gets a chance to retry, \
+             and the oversized historical row stays uncapped forever"
+        );
+
+        // Confirm the retry actually works once the failure is gone.
+        conn.execute_batch("DROP TRIGGER rtk_test_block_cap_update")
+            .expect("drop trigger");
+        run_schema_migrations(&conn).expect("retry succeeds");
+        let input_after_retry: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM commands WHERE rtk_cmd = 'rtk read huge.log'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row present");
+        assert_eq!(input_after_retry, 7_500);
+
+        drop(conn);
+        env::remove_var("RTK_TRACK_CAP_CHARS");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 6j. get_by_command uses a weighted savings rate, not an unweighted
+    // average -- regression test for AVG(savings_pct) giving misleading
+    // results when many small, near-0%-savings invocations dilute the
+    // average of a high-volume command (see the write-up in this fix: a
+    // real install showed a 5.3% average for `rtk read` while the SUM of
+    // saved_tokens for that same command was 138.9M, entirely because 4,627
+    // of 5,180 calls genuinely saved 0% and 158 outliers supplied 99.86% of
+    // the total -- the unweighted AVG buried that skew completely).
+    //
+    // Setup: one small call (10% savings) + one large call (95% savings).
+    // Unweighted avg would read ~52.5%. The weighted rate must read ~95%.
+    #[test]
+    fn test_get_by_command_weighted_savings_rate() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let cmd_name = "weighted_test_cmd";
+
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, ?2, ?2, '', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    cmd_name,
+                    100_i64, 90_i64, 10_i64, 10.0_f64, 5_i64
+                ],
+            )
+            .expect("insert small invocation");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, ?2, ?2, '', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    cmd_name,
+                    100_000_i64, 5_000_i64, 95_000_i64, 95.0_f64, 10_i64
+                ],
+            )
+            .expect("insert large invocation");
+
+        let by_cmd = tracker
+            .get_by_command(None)
+            .expect("Failed to get by_command stats");
+        let (_name, _count, _saved, rate, _time) = by_cmd
+            .iter()
+            .find(|(name, ..)| name == cmd_name)
+            .expect("test command not found in by_command stats");
+
+        // Weighted rate = (10 + 95,000) * 100.0 / (100 + 100,000) ~= 94.99%.
+        // Unweighted avg would be (10.0 + 95.0) / 2 = 52.5% -- the gap proves
+        // the fix works.
+        assert!(
+            *rate > 90.0,
+            "expected weighted rate >90%, got {:.1}% -- unweighted avg would be ~52.5%",
+            rate
+        );
+    }
+
+    // 6k. low_savings_commands (feeds telemetry's low-savings flagging) had
+    // the same unweighted-AVG(savings_pct) flaw as get_by_command, fixed the
+    // same way. A command with one huge, well-optimized call (95% real
+    // savings) alongside many tiny near-0%-savings calls must NOT get
+    // flagged as "low savings" just because the unweighted per-call average
+    // sits under the 30% threshold.
+    #[test]
+    fn test_low_savings_commands_uses_weighted_rate_not_unweighted_average() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let cmd_name = "low_savings_weighted_test_cmd";
+
+        // 9 tiny calls at ~10% savings each (unweighted avg alone would sit
+        // well under 30%), plus 1 huge call at 95% real savings.
+        for _ in 0..9 {
+            tracker
+                .conn
+                .execute(
+                    "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                     VALUES (?1, ?2, ?2, '', 100, 90, 10, 10.0, 1)",
+                    params![Utc::now().to_rfc3339(), cmd_name],
+                )
+                .expect("insert tiny call");
+        }
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
+                 VALUES (?1, ?2, ?2, '', 1000000, 50000, 950000, 95.0, 10)",
+                params![Utc::now().to_rfc3339(), cmd_name],
+            )
+            .expect("insert huge call");
+
+        // Weighted rate: (9*10 + 950,000) * 100 / (9*100 + 1,000,000) ~= 94.9%
+        // Unweighted avg: (9*10.0 + 95.0) / 10 = 18.5% -- would wrongly flag
+        // this command as "low savings" under the old HAVING avg_sav < 30.0.
+        let low = tracker
+            .low_savings_commands(50)
+            .expect("Failed to get low_savings_commands");
+        assert!(
+            !low.iter().any(|(name, _)| name == cmd_name),
+            "weighted rate ~95% must not be flagged as low-savings (unweighted avg ~18.5% would wrongly flag it): {low:?}"
+        );
     }
 
     // 7. get_db_path respects environment variable RTK_DB_PATH
