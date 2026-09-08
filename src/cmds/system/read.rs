@@ -64,16 +64,8 @@ pub fn run(
         );
     }
 
-    filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
-
-    let (raw, rtk_output) = if line_numbers {
-        (
-            format_with_line_numbers(&content),
-            format_with_line_numbers(&filtered),
-        )
-    } else {
-        (content.clone(), filtered.clone())
-    };
+    let (raw, rtk_output) =
+        prepare_outputs(&content, &filtered, max_lines, tail_lines, line_numbers, &lang);
     let shown = never_worse(&raw, &rtk_output);
     print!("{}", shown);
     timer.track(
@@ -116,7 +108,7 @@ pub fn run_stdin(
 
     // Apply filter
     let filter = filter::get_filter(level);
-    let mut filtered = filter.filter(&content, &lang);
+    let filtered = filter.filter(&content, &lang);
 
     if verbose > 0 {
         let original_lines = content.lines().count();
@@ -132,16 +124,8 @@ pub fn run_stdin(
         );
     }
 
-    filtered = apply_line_window(&filtered, max_lines, tail_lines, &lang);
-
-    let (raw, rtk_output) = if line_numbers {
-        (
-            format_with_line_numbers(&content),
-            format_with_line_numbers(&filtered),
-        )
-    } else {
-        (content.clone(), filtered.clone())
-    };
+    let (raw, rtk_output) =
+        prepare_outputs(&content, &filtered, max_lines, tail_lines, line_numbers, &lang);
     let shown = never_worse(&raw, &rtk_output);
     print!("{}", shown);
 
@@ -157,6 +141,35 @@ fn format_with_line_numbers(content: &str) -> String {
         out.push_str(&format!("{:>width$} │ {}\n", i + 1, line, width = width));
     }
     out
+}
+
+/// Build the (raw, rtk_output) pair `timer.track` compares, windowing BOTH
+/// sides by `--max-lines`/`--tail-lines` before the comparison -- not just
+/// the filtered side. Content dropped by an explicit user-requested window
+/// is the user choosing to see less, not RTK compressing anything; counting
+/// it as "saved tokens" credited a single `--max-lines` read on a large file
+/// with the entire un-shown remainder as a fake saving (see #2805/#1045: one
+/// bioinformatics file read alone reported 250M+ phantom saved tokens this
+/// way).
+fn prepare_outputs(
+    content: &str,
+    filtered: &str,
+    max_lines: Option<usize>,
+    tail_lines: Option<usize>,
+    line_numbers: bool,
+    lang: &Language,
+) -> (String, String) {
+    let raw_windowed = apply_line_window(content, max_lines, tail_lines, lang);
+    let filtered_windowed = apply_line_window(filtered, max_lines, tail_lines, lang);
+
+    if line_numbers {
+        (
+            format_with_line_numbers(&raw_windowed),
+            format_with_line_numbers(&filtered_windowed),
+        )
+    } else {
+        (raw_windowed, filtered_windowed)
+    }
 }
 
 fn apply_line_window(
@@ -212,6 +225,50 @@ fn main() {{
         // Test that run_stdin has correct signature and compiles
         // We don't actually run it because it would hang waiting for stdin
         // Compile-time verification that the function exists with correct signature
+    }
+
+    // Regression tests for #2805/#1045: the raw tracking baseline must be
+    // windowed the same as the filtered output, or content outside an
+    // explicit --max-lines/--tail-lines window gets counted as a fake
+    // "saving" -- a single large file read this way reported 250M+ phantom
+    // saved tokens in the wild.
+    #[test]
+    fn test_prepare_outputs_max_lines_windows_tracking_baseline() {
+        let input = "alpha\nbravo\ncharlie\ndelta\n";
+        let (raw, rtk_output) =
+            prepare_outputs(input, input, Some(2), None, false, &Language::Unknown);
+
+        // Both sides windowed identically -> no phantom savings.
+        assert_eq!(raw, rtk_output);
+        assert!(raw.starts_with("alpha\n"));
+        assert!(raw.contains("more lines"));
+        assert!(!raw.contains("bravo"));
+        assert!(!raw.contains("charlie"));
+    }
+
+    #[test]
+    fn test_prepare_outputs_tail_lines_windows_tracking_baseline() {
+        let input = "alpha\nbravo\ncharlie\ndelta\n";
+        let (raw, rtk_output) =
+            prepare_outputs(input, input, None, Some(2), false, &Language::Unknown);
+
+        assert_eq!(raw, "charlie\ndelta\n");
+        assert_eq!(rtk_output, raw);
+    }
+
+    #[test]
+    fn test_prepare_outputs_real_filter_savings_still_counted_inside_window() {
+        // The window must not hide genuine filter savings -- only content
+        // OUTSIDE the window should stop counting.
+        let content = "keep me\n// comment\nkeep me too\nmore content\nfinal line\n";
+        let filtered = "keep me\nkeep me too\nmore content\nfinal line\n"; // comment stripped
+        let (raw, rtk_output) =
+            prepare_outputs(content, filtered, Some(2), None, false, &Language::Unknown);
+
+        assert_ne!(
+            raw, rtk_output,
+            "a real filter difference inside the window must still show up"
+        );
     }
 
     #[test]
