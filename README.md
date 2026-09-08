@@ -51,6 +51,7 @@ RTK intercepts shell commands and compresses their output before your agent read
 | `git add/commit/push` | Confirmation line instead of full progress output |
 | `cargo test` / `npm test` | Failures only, passing tests collapsed to a count |
 | `ruff check` | Grouped by rule and file |
+| `sqlfluff lint` | Grouped by rule and file |
 | `pytest` | Failures only, traceback trimmed |
 | `go test` | NDJSON parsed, failures only |
 | `docker ps` | Essential fields only |
@@ -153,6 +154,8 @@ Four strategies applied per command type:
 3. **Truncation** - Keeps relevant context, cuts redundancy
 4. **Deduplication** - Collapses repeated log lines with counts
 
+> **Does RTK break Claude's prompt cache?** No. RTK filters output once per command. The result is stored in history and cached normally on subsequent API calls, so the cache keeps working as expected. Smaller outputs also mean cheaper cache writes and reads. See [Troubleshooting](docs/guide/resources/troubleshooting.md#does-rtk-break-claudes-prompt-cache) for details.
+
 ## Commands
 
 > Percentages below are **reductions in bash output**, not reductions in your bill. See [How Savings Work](#how-savings-work).
@@ -206,6 +209,8 @@ rtk test <cmd>                  # Generic test wrapper - failures only (-90%)
 ```bash
 rtk lint                        # ESLint grouped by rule/file
 rtk lint biome                  # Supports other linters
+rtk sqlfluff lint               # SQL linting (JSON, -75%)
+rtk sqlfluff lint models/       # Lint a specific directory (pass path after `lint`)
 rtk tsc                         # TypeScript errors grouped by file
 rtk next build                  # Next.js build compact
 rtk prettier --check .          # Files needing formatting
@@ -357,6 +362,8 @@ rtk init --show             # Verify installation
 ```
 
 After install, **restart Claude Code**.
+
+By default `RTK.md` says nothing about RTK itself. Set `[awareness] level = "high"` in `config.toml` to let the agent know `rtk gain` / `rtk proxy`, or `"full"` for an agent without hook support (or not yet supported by RTK) so it prefixes `rtk` itself — see [Configuration](docs/guide/getting-started/configuration.md#awareness-level).
 
 ## Windows
 

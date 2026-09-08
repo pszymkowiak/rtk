@@ -19,7 +19,7 @@ use cmds::jvm::{gradlew_cmd, mvn_cmd};
 use cmds::php::{
     ecs_cmd, paratest_cmd, pest_cmd, php_cmd, phpstan_cmd, phpt_cmd, phpunit_cmd, pint_cmd,
 };
-use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd, uv_cmd};
+use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd, sqlfluff_cmd, uv_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::scala::sbt_cmd;
@@ -724,6 +724,13 @@ enum Commands {
     /// Ruff linter/formatter with compact output
     Ruff {
         /// Ruff arguments (e.g., check, format --check)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// SQLFluff SQL linter with compact output
+    Sqlfluff {
+        /// SQLFluff arguments (e.g., lint models/, fix models/staging/)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1460,6 +1467,22 @@ fn run_bunx_tool(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     }
 }
 
+/// `awareness.level` for `rtk init`. A malformed config.toml falls back to `default` with a
+/// warning instead of silently installing the wrong awareness file.
+fn configured_awareness_level() -> core::config::AwarenessLevel {
+    match core::config::Config::load() {
+        Ok(config) => config.awareness.level,
+        Err(e) => {
+            let reason = e.to_string();
+            let first_line = reason.lines().next().unwrap_or("unreadable");
+            eprintln!(
+                "rtk: warning: could not read config.toml ({first_line}); using awareness.level = \"default\""
+            );
+            core::config::AwarenessLevel::default()
+        }
+    }
+}
+
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1767,6 +1790,16 @@ where
     }
 }
 
+fn is_native_test_expression(command: &[String]) -> bool {
+    match command.first().map(String::as_str) {
+        // `!` and `(` are shell syntax too, so they only mark a native
+        // expression when what they apply to is one.
+        Some("!") | Some("(") => is_native_test_expression(&command[1..]),
+        Some(arg) => arg.starts_with('-'),
+        None => false,
+    }
+}
+
 fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
@@ -2040,8 +2073,13 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Test { command } => {
-            let cmd = command.join(" ");
-            runner::run_test(&cmd, cli.verbose)?
+            if is_native_test_expression(&command) {
+                let args: Vec<OsString> = command.into_iter().map(OsString::from).collect();
+                core::runner::run_passthrough("test", &args, cli.verbose)?
+            } else {
+                let cmd = command.join(" ");
+                runner::run_test(&cmd, cli.verbose)?
+            }
         }
 
         Commands::Json {
@@ -2201,6 +2239,11 @@ fn run_cli() -> Result<i32> {
             let ctx = hooks::init::InitContext {
                 verbose: cli.verbose,
                 dry_run,
+                awareness: if show || uninstall {
+                    core::config::AwarenessLevel::default()
+                } else {
+                    configured_awareness_level()
+                },
             };
             let patch_mode = if auto_patch {
                 hooks::init::PatchMode::Auto
@@ -2611,6 +2654,8 @@ fn run_cli() -> Result<i32> {
 
         Commands::Ruff { args } => ruff_cmd::run(&args, cli.verbose)?,
 
+        Commands::Sqlfluff { args } => sqlfluff_cmd::run(&args, cli.verbose)?,
+
         Commands::Pytest { args } => pytest_cmd::run(&args, cli.verbose)?,
 
         Commands::Mypy { args } => mypy_cmd::run(&args, cli.verbose)?,
@@ -3014,6 +3059,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Npx { .. }
             | Commands::Curl { .. }
             | Commands::Ruff { .. }
+            | Commands::Sqlfluff { .. }
             | Commands::Pytest { .. }
             | Commands::Php { .. }
             | Commands::Phpunit { .. }
@@ -3263,6 +3309,7 @@ mod tests {
         let ctx = hooks::init::InitContext {
             verbose: 2,
             dry_run: true,
+            ..Default::default()
         };
 
         let result = uninstall_init_dispatch(
@@ -3378,6 +3425,30 @@ mod tests {
     }
 
     #[test]
+    fn test_dash_d_routes_to_native_test_expression() {
+        let command = vec!["-d".to_string(), "graphify-out".to_string()];
+        assert!(is_native_test_expression(&command));
+    }
+
+    #[test]
+    fn test_bang_before_command_is_not_a_native_expression() {
+        let command = vec!["!".to_string(), "false".to_string()];
+        assert!(!is_native_test_expression(&command));
+    }
+
+    #[test]
+    fn test_bang_before_operator_is_a_native_expression() {
+        let command = vec!["!".to_string(), "-d".to_string(), "dir".to_string()];
+        assert!(is_native_test_expression(&command));
+    }
+
+    #[test]
+    fn test_cargo_test_stays_test_runner() {
+        let command = vec!["cargo".to_string(), "test".to_string()];
+        assert!(!is_native_test_expression(&command));
+    }
+
+    #[test]
     fn test_try_parse_git_with_dash_c_succeeds() {
         let result = Cli::try_parse_from(["rtk", "git", "-C", "/path", "status"]);
         assert!(
@@ -3482,6 +3553,7 @@ mod tests {
             "npx",
             "curl",
             "ruff",
+            "sqlfluff",
             "pytest",
             "mypy",
             "rake",
