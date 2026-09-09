@@ -14,13 +14,14 @@ use crate::hooks::constants::{
 };
 
 use super::constants::{
-    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND, DROID_DIR,
-    DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
-    DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
-    HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, OMP_DIR, OMP_LOCAL_DIR, PI_AGENT_STATE_FILE, PI_CODING_AGENT_DIR_ENV, PI_DIR,
-    PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
-    SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
+    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CODEX_HOOK_COMMAND,
+    CODEX_SHELL_MATCHER, CURSOR_HOOK_COMMAND, DROID_DIR, DROID_EXECUTE_MATCHER, DROID_HOME_ENV,
+    DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR, DROID_HOOK_COMMAND, DROID_SETTINGS_FILE,
+    GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
+    HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, OMP_DIR,
+    OMP_LOCAL_DIR, PI_AGENT_STATE_FILE, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR,
+    PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
     VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
 };
 use super::integrity;
@@ -2634,14 +2635,129 @@ fn normalized_yaml_scalar(value: &str) -> Option<String> {
 }
 
 fn run_codex_mode(global: bool, ctx: InitContext) -> Result<()> {
-    let (agents_md_path, rtk_md_path) = if global {
+    let (agents_md_path, rtk_md_path, hooks_path) = if global {
         let codex_dir = resolve_codex_dir()?;
-        (codex_dir.join(AGENTS_MD), codex_dir.join(RTK_MD))
+        (
+            codex_dir.join(AGENTS_MD),
+            codex_dir.join(RTK_MD),
+            codex_dir.join(HOOKS_JSON),
+        )
     } else {
-        (PathBuf::from(AGENTS_MD), PathBuf::from(RTK_MD))
+        (
+            PathBuf::from(AGENTS_MD),
+            PathBuf::from(RTK_MD),
+            PathBuf::from(CODEX_DIR).join(HOOKS_JSON),
+        )
     };
 
+    let hook_installed = patch_codex_hooks_json(&hooks_path, ctx)?;
+    if !ctx.dry_run {
+        let state = if hook_installed {
+            "installed"
+        } else {
+            "already present"
+        };
+        println!("  Hook:  {} ({state})", hooks_path.display());
+    }
+
     run_codex_mode_with_paths(agents_md_path, rtk_md_path, global, ctx)
+}
+
+/// Install RTK's `PreToolUse` handler into a Codex `hooks.json`.
+///
+/// Codex nests its events under a single top-level `hooks` key (unlike
+/// Antigravity's map of hook names), and merges every handler registered for an
+/// event. RTK appends one entry and must leave the rest of the file — a user's
+/// `PostToolUse` formatter, a `Stop` reviewer — untouched.
+///
+/// Returns `true` when the file was written, `false` on an idempotent re-run.
+fn patch_codex_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
+    let InitContext {
+        verbose, dry_run, ..
+    } = ctx;
+
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let content = strip_leading_bom(&content);
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            from_json_str(content)
+                .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if codex_hook_already_present(&root) {
+        if verbose > 0 {
+            eprintln!("Codex hooks.json: RTK hook already present");
+        }
+        return Ok(false);
+    }
+
+    let hooks = root
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", path.display()))?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let pre_tool_use = hooks
+        .as_object_mut()
+        .with_context(|| format!("{}: \"hooks\" is not a JSON object", path.display()))?
+        .entry(PRE_TOOL_USE_KEY)
+        .or_insert_with(|| serde_json::json!([]));
+    pre_tool_use
+        .as_array_mut()
+        .with_context(|| format!("{}: \"{PRE_TOOL_USE_KEY}\" is not an array", path.display()))?
+        .push(serde_json::json!({
+            "matcher": CODEX_SHELL_MATCHER,
+            "hooks": [
+                { "type": "command", "command": CODEX_HOOK_COMMAND, "timeout": 10 }
+            ]
+        }));
+
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize hooks.json")?;
+
+    if dry_run {
+        println!("[dry-run] would patch Codex hooks.json: {}", path.display());
+        if verbose > 0 {
+            println!("[dry-run] content:\n{}", serialized);
+        }
+        return Ok(true);
+    }
+
+    if path.exists() {
+        let backup_path = path.with_extension("json.bak");
+        fs::copy(path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    } else if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    atomic_write(path, &serialized)?;
+
+    Ok(true)
+}
+
+fn codex_hook_already_present(root: &serde_json::Value) -> bool {
+    root.get("hooks")
+        .and_then(|hooks| hooks.get(PRE_TOOL_USE_KEY))
+        .and_then(|events| events.as_array())
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|group| group.get("hooks")?.as_array())
+                .flatten()
+                .filter_map(|handler| handler.get("command")?.as_str())
+                .any(|command| command == CODEX_HOOK_COMMAND)
+        })
+        .unwrap_or(false)
 }
 
 fn run_codex_mode_with_paths(
@@ -7702,6 +7818,66 @@ mod tests {
             "original",
             "dry-run must not modify file contents"
         );
+    }
+
+    #[test]
+    fn test_codex_hooks_json_preserves_other_events() {
+        // A real Codex user's hooks.json already carries PostToolUse/Stop
+        // handlers (the shipped design-detector skill installs both). Losing
+        // them silently disables their tooling.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON);
+        fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"command":"./fmt.sh"}]}],
+                        "Stop":[{"hooks":[{"command":"./review.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert!(patch_codex_hooks_json(&path, InitContext::default()).unwrap());
+
+        let root: serde_json::Value = from_json_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "./fmt.sh"
+        );
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "./review.sh"
+        );
+        let entry = &root["hooks"]["PreToolUse"][0];
+        // Codex treats `matcher` as a regex and does not special-case a bare
+        // "*": a handler registered with "*" never fires (observed live).
+        assert_eq!(entry["matcher"], "Bash");
+        assert_eq!(entry["hooks"][0]["command"], "rtk hook codex");
+    }
+
+    #[test]
+    fn test_codex_hooks_json_install_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON);
+
+        assert!(patch_codex_hooks_json(&path, InitContext::default()).unwrap());
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(!patch_codex_hooks_json(&path, InitContext::default()).unwrap());
+        assert_eq!(first, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn test_codex_hooks_json_dry_run_writes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON);
+
+        patch_codex_hooks_json(
+            &path,
+            InitContext {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!path.exists(), "dry-run must not create hooks.json");
     }
 
     #[test]
