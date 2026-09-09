@@ -37,9 +37,6 @@ const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 // Embedded Kilo Code plugin (auto-rewrite)
 const KILOCODE_PLUGIN: &str = include_str!("../../hooks/kilocode/rtk.ts");
 
-// Embedded slim RTK awareness instructions
-const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
-const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
 // Stable code marker used to recognize a modified RTK extension without
 // relying on explanatory comments that users may remove. The marker matches
 // both the current `pi.exec` call and older stock revisions that imported
