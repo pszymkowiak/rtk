@@ -540,7 +540,7 @@ section "Diff"
 
 assert_ok       "rtk diff identical files"     rtk diff Cargo.toml Cargo.toml
 assert_fails    "rtk diff differing files"     rtk diff Cargo.toml LICENSE
-assert_contains "rtk diff shows changes"       "added" rtk diff Cargo.toml LICENSE
+assert_contains "rtk diff shows classic changes" "^< " bash -c 'rtk diff "$1" "$2"; [[ $? -eq 1 ]]' _ Cargo.toml LICENSE
 
 # ── 37. Wc ────────────────────────────────────────────
 
