@@ -1499,7 +1499,7 @@ pub(crate) fn get_db_path() -> Result<PathBuf> {
     // `config::cached_config`), not a fresh `Config::load()`: this runs inside
     // `Tracker::new()`, which `log_hook_decision` now calls on every single
     // PreToolUse hook invocation — `hook_rewrite_params()` (called earlier in the
-    // same hook invocation, via `get_rewritten`) already reads config too, so
+    // same hook invocation, via `hooks::decision::decide`) already reads config too, so
     // without caching that's two full disk-read-plus-TOML-parse round trips per
     // Bash tool call instead of one.
     if let Some(db_path) = crate::core::config::cached_config()
