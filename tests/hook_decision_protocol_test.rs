@@ -1,18 +1,13 @@
-//! Characterization of the two hook decision entry points, end to end.
+//! End-to-end coverage of the hook decision entry points.
 //!
 //! `rtk rewrite`'s exit-code protocol is a public contract consumed entirely
-//! outside this crate — `hooks/claude/rtk-rewrite.sh`, `hooks/cursor/rtk-rewrite.sh`,
-//! `hooks/pi/rtk.ts`, `hooks/hermes/rtk-rewrite/__init__.py`, `hooks/opencode/rtk.ts`
-//! and `openclaw/index.ts` all branch on it — yet no Rust test ever ran `run()`.
-//! `rewrite_cmd`'s own `exit_code_protocol` module asserts against a locally
-//! re-implemented `expected_exit_code()` table, so the real mapping could change
-//! without a single failure, including the #1155 invariant that a `Default`
-//! verdict must exit 3 and never 0.
-//!
-//! These tests spawn the real binary in a sandboxed HOME/CLAUDE_CONFIG_DIR and
-//! pin the actual `(exit code, stdout)` pairs. They exist to make the decision-flow
-//! consolidation provably behavior-preserving: they must keep passing, unmodified,
-//! across that refactor.
+//! outside this crate -- `hooks/hermes/rtk-rewrite/__init__.py`,
+//! `hooks/opencode/rtk.ts`, `hooks/pi/rtk.ts` and `openclaw/index.ts` all
+//! branch on it -- and `rewrite_cmd`'s in-module `exit_code_protocol` asserts
+//! against a hand-copied `expected_exit_code()` table without ever calling
+//! `run()`. These tests spawn the real binary in a sandboxed
+//! HOME/CLAUDE_CONFIG_DIR and pin the actual `(exit code, stdout)` pairs,
+//! including the #1155 invariant that a `Default` verdict exits 3 and never 0.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -59,21 +54,6 @@ impl Sandbox {
         );
         std::fs::write(project.join(".claude/settings.json"), settings).expect("write settings");
 
-        let quote = |rules: &[&str]| {
-            rules
-                .iter()
-                .map(|r| format!("\"Bash({r})\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let settings = format!(
-            r#"{{"permissions": {{"deny": [{}], "ask": [{}], "allow": [{}]}}}}"#,
-            quote(deny),
-            quote(ask),
-            quote(allow)
-        );
-        std::fs::write(project.join(".claude/settings.json"), settings).expect("write settings");
-
         Self {
             _root: root,
             home,
@@ -101,10 +81,17 @@ impl Sandbox {
             .env("LC_ALL", "C")
             .output()
             .expect("spawn rtk");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        // A crash produces empty stdout too, which would let every "expect no
+        // output" assertion below pass vacuously.
+        assert!(
+            !stderr.contains("panicked"),
+            "rtk panicked on {args:?}: {stderr}"
+        );
         (
             out.status.code().expect("exit code"),
             String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
         )
     }
 
@@ -159,7 +146,7 @@ impl Sandbox {
             .env("LC_ALL", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn rtk hook claude");
         child
@@ -169,6 +156,15 @@ impl Sandbox {
             .write_all(payload.as_bytes())
             .expect("write payload");
         let out = child.wait_with_output().expect("wait rtk");
+        // The hook protocol requires exit 0 whatever it decides; without this a
+        // crash is indistinguishable from a deliberate defer, and every
+        // `assert_eq!(..., None)` below would pass vacuously.
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "rtk hook claude exited non-zero for {cmd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
@@ -333,11 +329,10 @@ mod recall_tracking {
 /// The two decision paths, side by side on one corpus.
 ///
 /// `rtk rewrite` (subprocess path) and `rtk hook claude` (in-process path)
-/// answer the same question through two independently written flows. These
-/// tests pin what each one does today, together, so a consolidation that
-/// changes either is caught here rather than by a user.
+/// answer the same question for the same command. Asserting both against one
+/// corpus keeps a change to either from silently moving them apart.
 ///
-/// Modelled on `registry.rs`'s `segmenter_consistency` module (#3704).
+/// Follows the shape of `registry.rs`'s `segmenter_consistency` module.
 mod decision_consistency {
     use super::Sandbox;
 
@@ -381,21 +376,12 @@ mod decision_consistency {
         }
     }
 
-    /// The one place the two paths genuinely disagree, pinned deliberately.
+    /// The one place the two paths differ.
     ///
-    /// For a command that is already RTK-prefixed the rewrite is a no-op.
-    /// `hook_cmd::get_rewritten` suppresses it (`rewritten == cmd` → `None` →
-    /// defer); `rewrite_cmd` has no such check and reports it as a normal
-    /// rewrite, so `rtk rewrite` exits 3 with the command unchanged on stdout.
-    ///
-    /// This is accidental rather than designed, and it has one observable
-    /// consequence: `hooks/claude/rtk-rewrite.sh` guards for an identical
-    /// rewrite in its exit-0 branch but *not* in its exit-3 branch, so Claude
-    /// Code prompts the user for a command RTK did not touch. Every other
-    /// delegate gates on `rewritten != command` and is unaffected.
-    ///
-    /// Pinned here, not fixed here — resolving it is a deliberate behavior
-    /// change and its own decision.
+    /// A command that is already RTK-prefixed rewrites to itself. Every hook
+    /// discards that; `rtk rewrite` reports it, exiting 3 with the command
+    /// unchanged on stdout. The plugins that shell out to it gate on
+    /// `rewritten != command` for exactly this reason.
     #[test]
     fn identity_rewrite_is_where_the_paths_diverge() {
         let sb = Sandbox::bare();
@@ -416,15 +402,12 @@ mod decision_consistency {
     }
 }
 
-/// `rtk hook check` as it behaves today: a raw rewrite-rule probe.
+/// `rtk hook check` answers the same question the hooks answer.
 ///
-/// It calls `registry::rewrite_command` directly, with no permission verdict
-/// and none of the gates the hooks apply, so it answers a different question
-/// than the hooks it is meant to diagnose — it reports a rewrite for commands
-/// both hook paths refuse to touch.
-///
-/// Pinned before that is changed, so the fix shows up as an explicit diff.
-mod hook_check_current_behavior {
+/// A diagnostic that reported a rewrite the hooks refuse to apply would be
+/// worse than none, so it routes through the shared decision and is pinned
+/// here against the hooks themselves.
+mod hook_check {
     use super::Sandbox;
 
     #[test]
@@ -441,27 +424,109 @@ mod hook_check_current_behavior {
         assert_eq!((code, stdout.trim()), (1, ""));
     }
 
-    /// The drift: both hook paths defer on these, `hook check` claims a rewrite.
+    /// Both hook paths refuse these, so the diagnostic must refuse them too.
     #[test]
-    fn claims_rewrites_the_hooks_would_never_apply() {
+    fn agrees_with_the_hooks_on_what_is_never_rewritten() {
         let sb = Sandbox::bare();
 
-        let (code, stdout, _) = sb.run(&["hook", "check", "git status $(rm -rf /tmp/x)"]);
-        assert_eq!(
-            (code, stdout.trim()),
-            (0, "rtk git status $(rm -rf /tmp/x)"),
-            "today: a command substitution is reported as rewritable"
-        );
-        assert_eq!(sb.hook_claude_rewrite("git status $(rm -rf /tmp/x)"), None);
-        assert_eq!(sb.rewrite("git status $(rm -rf /tmp/x)").0, 1);
+        for cmd in [
+            "git status $(rm -rf /tmp/x)",
+            "git log > /tmp/out.txt",
+            "cat <<EOF",
+        ] {
+            let (code, stdout, _) = sb.run(&["hook", "check", cmd]);
+            assert_eq!((code, stdout.trim()), (1, ""), "hook check on: {cmd}");
+            assert_eq!(sb.hook_claude_rewrite(cmd), None, "hook claude on: {cmd}");
+            assert_eq!(sb.rewrite(cmd).0, 1, "rtk rewrite on: {cmd}");
+        }
+    }
 
-        let (code, stdout, _) = sb.run(&["hook", "check", "git log > /tmp/out.txt"]);
+    /// An already-RTK-prefixed command rewrites to itself, and no agent applies
+    /// that: the in-process hosts discard it in `hook_cmd`, and the ones whose
+    /// plugin shells out to `rtk rewrite` discard it themselves. Only the bare
+    /// `rtk rewrite` CLI reports it -- see `decision_consistency`.
+    #[test]
+    fn no_agent_applies_a_rewrite_that_changed_nothing() {
+        let sb = Sandbox::bare();
+
+        for agent in ["claude", "pi", "kimi"] {
+            let (code, stdout, _) = sb.run(&["hook", "check", "--agent", agent, "rtk git status"]);
+            assert_eq!((code, stdout.trim()), (1, ""), "agent: {agent}");
+        }
+        assert_eq!(sb.hook_claude_rewrite("rtk git status"), None);
+
+        // The CLI itself still reports it, which is what the delegates guard against.
+        assert_eq!(sb.rewrite("rtk git status"), (3, "rtk git status".into()));
+    }
+
+    /// Every install target answers; only a genuine typo is rejected.
+    #[test]
+    fn answers_for_every_supported_agent() {
+        let sb = Sandbox::bare();
+        for agent in [
+            "claude",
+            "copilot",
+            "cursor",
+            "gemini",
+            "droid",
+            "vibe",
+            "opencode",
+            "openclaw",
+            "pi",
+            "omp",
+            "hermes",
+            "codex",
+            "windsurf",
+            "cline",
+            "kilocode",
+            "antigravity",
+            "kimi",
+        ] {
+            let (code, stdout, _) = sb.run(&["hook", "check", "--agent", agent, "git status"]);
+            assert_eq!(
+                (code, stdout.trim()),
+                (0, "rtk git status"),
+                "agent: {agent}"
+            );
+        }
+    }
+
+    /// `--agent` selects whose rules are consulted. Hosts read different
+    /// settings files, so answering with Claude's verdict for another agent
+    /// would misdescribe the very hook being diagnosed: here a Claude deny rule
+    /// must not deny for Gemini, which has no rules of its own in this sandbox.
+    #[test]
+    fn agent_flag_selects_the_hosts_own_rules() {
+        let sb = Sandbox::with_rules(&["git status"], &[], &[]);
+
+        let (code, stdout, _) = sb.run(&["hook", "check", "--agent", "claude", "git status"]);
+        assert_eq!((code, stdout.trim()), (1, ""), "claude denies");
+
+        let (code, stdout, _) = sb.run(&["hook", "check", "--agent", "gemini", "git status"]);
         assert_eq!(
             (code, stdout.trim()),
-            (0, "rtk git log > /tmp/out.txt"),
-            "today: a file redirect is reported as rewritable"
+            (0, "rtk git status"),
+            "gemini has no deny rule here, so the rewrite stands"
         );
-        assert_eq!(sb.hook_claude_rewrite("git log > /tmp/out.txt"), None);
-        assert_eq!(sb.rewrite("git log > /tmp/out.txt").0, 1);
+    }
+
+    #[test]
+    fn unknown_agent_is_rejected_rather_than_answered_for_claude() {
+        let sb = Sandbox::bare();
+        let (code, stdout, stderr) = sb.run(&["hook", "check", "--agent", "nope", "git status"]);
+        assert_eq!((code, stdout.trim()), (2, ""));
+        assert!(stderr.contains("Unknown agent: nope"), "stderr: {stderr}");
+    }
+
+    /// A denied command is not rewritten, and says so distinctly.
+    #[test]
+    fn reports_a_deny_rule_separately_from_no_rewrite() {
+        let sb = Sandbox::with_rules(&["git status"], &[], &[]);
+        let (code, stdout, stderr) = sb.run(&["hook", "check", "git status"]);
+        assert_eq!((code, stdout.trim()), (1, ""));
+        assert!(
+            stderr.contains("Denied by a permission rule"),
+            "stderr: {stderr}"
+        );
     }
 }

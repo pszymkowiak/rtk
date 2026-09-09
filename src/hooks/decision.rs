@@ -1,12 +1,13 @@
 //! The single place RTK decides what a hook should do with a command.
 //!
-//! Two entry points ask the same question — may this command be rewritten,
+//! Three entry points ask the same question — may this command be rewritten,
 //! and may the rewrite be auto-allowed?
 //!
 //! | Entry point | Verdict source | Identity rewrite |
 //! |---|---|---|
 //! | `rtk hook <agent>` (`hook_cmd`) | `check_command_for(cmd, host)` | suppressed |
 //! | `rtk rewrite` (`rewrite_cmd`, run as a subprocess by the shell/TS/Python delegates) | `check_command` (always `Host::Claude`) | reported |
+//! | `rtk hook check` (`main.rs`) | whatever the named `--agent` consults, via [`AgentPath`] | suppressed |
 //!
 //! [`decide`] is the shared answer. What legitimately differs between callers
 //! stays outside it: the verdict is passed in rather than looked up, so each
@@ -14,7 +15,7 @@
 //! machine's settings (#3146); and the no-op-rewrite policy lives in
 //! [`decide_for_agent`], which every hook shares and the CLI does not.
 
-use super::permissions::PermissionVerdict;
+use super::permissions::{check_command_for, Host, PermissionVerdict};
 use crate::discover::registry::rewrite_command;
 
 /// What a hook should do with a command.
@@ -141,6 +142,109 @@ pub(crate) fn suppress_identity(cmd: &str, decision: HookDecision) -> HookDecisi
     }
 }
 
+/// How the hook RTK installs for a given `--agent` actually reaches a decision.
+///
+/// `rtk init` supports more agents than [`Host`] has variants, because they
+/// differ in *whose* permission rules their hook consults — not all of them
+/// consult any. A diagnostic that ignores that reports the wrong hook's answer.
+///
+/// They do not differ on a rewrite that changed nothing: every agent discards
+/// it. The in-process hosts do so in `hook_cmd`; the ones that shell out to
+/// `rtk rewrite` do so in their own plugin, because `rtk rewrite` reports the
+/// no-op rather than suppressing it (see [`suppress_identity`]).
+pub(crate) enum AgentPath {
+    /// `rtk hook <agent>` — decides in this process, against the host's own
+    /// permission rules.
+    InProcess(Host),
+    /// A plugin or shell script that shells out to `rtk rewrite`. That entry
+    /// point has no way to be told which host is asking, so it always reads
+    /// Claude Code's rules.
+    ViaRewrite,
+    /// A rules-file install — RTK ships instructions telling the agent to
+    /// prefix commands itself. There is no hook and no permission surface, so
+    /// only the rewrite rules apply.
+    RulesOnly,
+}
+
+impl AgentPath {
+    /// The path for an `--agent` value, reporting the accepted values on stderr
+    /// when there is no such install target.
+    ///
+    /// Every [`crate::AgentTarget`] must resolve, plus the targets installed by
+    /// a flag rather than an enum variant — `rtk init --copilot`, `--gemini`,
+    /// `--codex`, `--opencode`, and OpenClaw's own installer — pinned by
+    /// `agent_path_covers_every_install_target`.
+    // Reached only from `rtk hook check`, never from a hook's own stream.
+    #[allow(clippy::print_stderr)]
+    pub(crate) fn from_agent(agent: &str) -> Option<Self> {
+        let path = Self::lookup(agent);
+        if path.is_none() {
+            eprintln!(
+                "Unknown agent: {} (expected one of: {})",
+                agent,
+                Self::AGENTS.join(", ")
+            );
+        }
+        path
+    }
+
+    /// The mapping itself, so tests can exercise it without writing to stderr.
+    fn lookup(agent: &str) -> Option<Self> {
+        match agent {
+            // `copilot` reads Claude Code's settings rather than a Copilot file
+            // (see `hook_cmd`'s `vscode_response` and `copilot_cli_response`).
+            "antigravity" | "cline" | "codex" | "kilocode" | "kimi" | "windsurf" => {
+                Some(Self::RulesOnly)
+            }
+            "claude" | "copilot" => Some(Self::InProcess(Host::Claude)),
+            "cursor" => Some(Self::InProcess(Host::Cursor)),
+            "droid" => Some(Self::InProcess(Host::Droid)),
+            "gemini" => Some(Self::InProcess(Host::Gemini)),
+            "hermes" | "omp" | "openclaw" | "opencode" | "pi" => Some(Self::ViaRewrite),
+            "vibe" => Some(Self::InProcess(Host::Vibe)),
+            _ => None,
+        }
+    }
+
+    /// The `--agent` values [`AgentPath::lookup`] accepts.
+    const AGENTS: &'static [&'static str] = &[
+        "antigravity",
+        "claude",
+        "cline",
+        "codex",
+        "copilot",
+        "cursor",
+        "droid",
+        "gemini",
+        "hermes",
+        "kilocode",
+        "kimi",
+        "omp",
+        "openclaw",
+        "opencode",
+        "pi",
+        "vibe",
+        "windsurf",
+    ];
+
+    /// The verdict this agent's hook would judge `cmd` against.
+    fn verdict(&self, cmd: &str) -> PermissionVerdict {
+        match self {
+            Self::InProcess(host) => check_command_for(cmd, *host),
+            // `rtk rewrite` always reads Claude Code's rules.
+            Self::ViaRewrite => check_command_for(cmd, Host::Claude),
+            // No hook, so no rules to consult.
+            Self::RulesOnly => PermissionVerdict::Default,
+        }
+    }
+
+    /// What this agent's hook would do with `cmd` — the same answer it gives at
+    /// runtime, including discarding a rewrite that changed nothing.
+    pub(crate) fn decide(&self, cmd: &str) -> HookDecision {
+        decide_for_agent(cmd, self.verdict(cmd))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +356,65 @@ mod tests {
         assert_eq!(
             suppress_identity("x", HookDecision::Defer),
             HookDecision::Defer
+        );
+    }
+
+    /// Every install target `rtk` supports must resolve, or `rtk hook check`
+    /// rejects an agent the user really installed. Derived from `AgentTarget`
+    /// so a new variant fails here instead of silently going unanswerable.
+    #[test]
+    fn agent_path_covers_every_install_target() {
+        use clap::ValueEnum;
+
+        for variant in crate::AgentTarget::value_variants() {
+            let name = variant
+                .to_possible_value()
+                .expect("AgentTarget variant is not skipped")
+                .get_name()
+                .to_string();
+            assert!(
+                AgentPath::lookup(&name).is_some(),
+                "unmapped AgentTarget: {name}"
+            );
+            assert!(
+                AgentPath::AGENTS.contains(&name.as_str()),
+                "AgentTarget missing from the error message: {name}"
+            );
+        }
+
+        // Install targets reached by a flag rather than an `AgentTarget`
+        // variant, so the loop above cannot see them.
+        for name in ["codex", "copilot", "gemini", "openclaw", "opencode"] {
+            assert!(AgentPath::lookup(name).is_some(), "unmapped: {name}");
+            assert!(AgentPath::AGENTS.contains(&name), "not listed: {name}");
+        }
+    }
+
+    /// Everything advertised in the error message must actually resolve.
+    #[test]
+    fn every_listed_agent_resolves() {
+        for name in AgentPath::AGENTS {
+            assert!(
+                AgentPath::lookup(name).is_some(),
+                "listed but unmapped: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_path_rejects_the_unknown() {
+        assert!(AgentPath::lookup("nope").is_none());
+        assert!(AgentPath::lookup("").is_none());
+        assert!(AgentPath::lookup("Claude").is_none());
+    }
+
+    /// A rules-file agent has no hook and no permission rules, so its answer
+    /// must not depend on any host's settings.
+    #[test]
+    fn rules_only_agent_uses_the_default_verdict() {
+        assert_eq!(
+            AgentPath::RulesOnly.verdict("git status"),
+            PermissionVerdict::Default
         );
     }
 }
