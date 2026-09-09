@@ -15,7 +15,7 @@ use crate::hooks::constants::{
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CODEX_HOOK_COMMAND,
-    CODEX_SHELL_MATCHER, CURSOR_HOOK_COMMAND, DROID_DIR, DROID_EXECUTE_MATCHER, DROID_HOME_ENV,
+    CODEX_SHELL_TOOL, CURSOR_HOOK_COMMAND, DROID_DIR, DROID_EXECUTE_MATCHER, DROID_HOME_ENV,
     DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR, DROID_HOOK_COMMAND, DROID_SETTINGS_FILE,
     GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
     HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, OMP_DIR,
@@ -1095,7 +1095,7 @@ fn uninstall_codex(global: bool, ctx: InitContext) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     if !global {
         anyhow::bail!(
-            "Uninstall only works with --global flag. For local projects, manually remove RTK from AGENTS.md"
+            "Uninstall only works with --global flag. For local projects, manually remove RTK from AGENTS.md and the RTK entry from .codex/hooks.json"
         );
     }
 
@@ -1172,7 +1172,108 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
         removed.push("AGENTS.md: removed @RTK.md reference".to_string());
     }
 
+    // The hook keeps rewriting commands long after the instruction files are
+    // gone, so uninstall has to reach into hooks.json too — otherwise `rtk init
+    // --codex --uninstall` reports success while the integration is still live.
+    let hooks_path = codex_dir.join(HOOKS_JSON);
+    if remove_codex_hook_entry(&hooks_path, ctx)? {
+        removed.push(format!(
+            "hooks.json: removed RTK hook ({})",
+            hooks_path.display()
+        ));
+    }
+
     Ok(removed)
+}
+
+/// Drop RTK's `PreToolUse` handler from a Codex `hooks.json`, leaving every
+/// other handler and event in place.
+///
+/// Prunes containers that RTK emptied — an orphaned `"PreToolUse": []` (or a
+/// `"hooks": {}`) would otherwise be left behind as a fossil of an integration
+/// that is no longer installed. A file that held nothing but RTK's hook is
+/// removed outright.
+///
+/// Returns `true` when something was removed.
+fn remove_codex_hook_entry(path: &Path, ctx: InitContext) -> Result<bool> {
+    let InitContext {
+        verbose, dry_run, ..
+    } = ctx;
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = strip_leading_bom(&content);
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut root: serde_json::Value = from_json_str(content)
+        .with_context(|| format!("Failed to parse {} as JSON", path.display()))?;
+
+    if !codex_hook_already_present(&root) {
+        return Ok(false);
+    }
+
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(false);
+    };
+    if let Some(groups) = hooks
+        .get_mut(PRE_TOOL_USE_KEY)
+        .and_then(|e| e.as_array_mut())
+    {
+        // Drop RTK's handlers, then drop any group left with no handlers at all.
+        for group in groups.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                handlers.retain(|handler| {
+                    handler.get("command").and_then(|c| c.as_str()) != Some(CODEX_HOOK_COMMAND)
+                });
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_none_or(|handlers| !handlers.is_empty())
+        });
+        if groups.is_empty() {
+            hooks.remove(PRE_TOOL_USE_KEY);
+        }
+    }
+    let hooks_now_empty = hooks.is_empty();
+    if hooks_now_empty {
+        root.as_object_mut()
+            .expect("root parsed as object above")
+            .remove("hooks");
+    }
+
+    let file_now_empty = root.as_object().is_some_and(|obj| obj.is_empty());
+
+    if dry_run {
+        if file_now_empty {
+            println!(
+                "[dry-run] would remove Codex hooks.json: {}",
+                path.display()
+            );
+        } else {
+            println!("[dry-run] would remove RTK hook from: {}", path.display());
+        }
+        return Ok(true);
+    }
+
+    if file_now_empty {
+        fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    } else {
+        let serialized =
+            serde_json::to_string_pretty(&root).context("Failed to serialize hooks.json")?;
+        atomic_write(path, &serialized)?;
+    }
+    if verbose > 0 {
+        eprintln!("Removed RTK hook from {}", path.display());
+    }
+
+    Ok(true)
 }
 
 /// Orchestrator: patch settings.json with RTK hook (binary command variant)
@@ -2711,7 +2812,7 @@ fn patch_codex_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
         .as_array_mut()
         .with_context(|| format!("{}: \"{PRE_TOOL_USE_KEY}\" is not an array", path.display()))?
         .push(serde_json::json!({
-            "matcher": CODEX_SHELL_MATCHER,
+            "matcher": CODEX_SHELL_TOOL,
             "hooks": [
                 { "type": "command", "command": CODEX_HOOK_COMMAND, "timeout": 10 }
             ]
@@ -7846,8 +7947,8 @@ mod tests {
             "./review.sh"
         );
         let entry = &root["hooks"]["PreToolUse"][0];
-        // Codex treats `matcher` as a regex and does not special-case a bare
-        // "*": a handler registered with "*" never fires (observed live).
+        // The matcher names Codex's shell tool exactly, so RTK's handler never
+        // runs for unrelated tools.
         assert_eq!(entry["matcher"], "Bash");
         assert_eq!(entry["hooks"][0]["command"], "rtk hook codex");
     }
@@ -7861,6 +7962,88 @@ mod tests {
         let first = fs::read_to_string(&path).unwrap();
         assert!(!patch_codex_hooks_json(&path, InitContext::default()).unwrap());
         assert_eq!(first, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn test_uninstall_codex_removes_hook_and_keeps_others() {
+        // Uninstall used to strip only the instruction files, leaving the hook
+        // rewriting commands forever — a "successful" uninstall that silently
+        // left the integration running.
+        let temp = TempDir::new().unwrap();
+        let codex_dir = temp.path();
+        let hooks_path = codex_dir.join(HOOKS_JSON);
+        fs::write(
+            &hooks_path,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"command":"./fmt.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(patch_codex_hooks_json(&hooks_path, InitContext::default()).unwrap());
+
+        let removed = uninstall_codex_at(codex_dir, InitContext::default()).unwrap();
+        assert!(
+            removed.iter().any(|r| r.contains("hooks.json")),
+            "uninstall must report the hook removal: {removed:?}"
+        );
+
+        let root: serde_json::Value =
+            from_json_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(
+            !codex_hook_already_present(&root),
+            "RTK hook must be gone after uninstall"
+        );
+        assert_eq!(
+            root["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "./fmt.sh",
+            "unrelated handlers must survive uninstall"
+        );
+        assert!(
+            root["hooks"].get(PRE_TOOL_USE_KEY).is_none(),
+            "an emptied PreToolUse list must not be left behind"
+        );
+    }
+
+    #[test]
+    fn test_uninstall_codex_removes_hooks_file_it_created() {
+        // If RTK created hooks.json, uninstall should leave no fossil behind.
+        let temp = TempDir::new().unwrap();
+        let codex_dir = temp.path();
+        let hooks_path = codex_dir.join(HOOKS_JSON);
+        assert!(patch_codex_hooks_json(&hooks_path, InitContext::default()).unwrap());
+
+        uninstall_codex_at(codex_dir, InitContext::default()).unwrap();
+        assert!(!hooks_path.exists(), "empty hooks.json should be removed");
+    }
+
+    #[test]
+    fn test_uninstall_codex_leaves_foreign_file_untouched() {
+        let temp = TempDir::new().unwrap();
+        let hooks_path = temp.path().join(HOOKS_JSON);
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"command":"./x.sh"}]}]}}"#;
+        fs::write(&hooks_path, original).unwrap();
+
+        assert!(!remove_codex_hook_entry(&hooks_path, InitContext::default()).unwrap());
+        assert_eq!(
+            fs::read_to_string(&hooks_path).unwrap(),
+            original,
+            "a file without RTK's hook must not be rewritten at all"
+        );
+    }
+
+    #[test]
+    fn test_uninstall_codex_hook_dry_run_writes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let hooks_path = temp.path().join(HOOKS_JSON);
+        patch_codex_hooks_json(&hooks_path, InitContext::default()).unwrap();
+        let before = fs::read_to_string(&hooks_path).unwrap();
+
+        assert!(remove_codex_hook_entry(
+            &hooks_path,
+            InitContext {
+                dry_run: true,
+                ..Default::default()
+            }
+        )
+        .unwrap());
+        assert_eq!(before, fs::read_to_string(&hooks_path).unwrap());
     }
 
     #[test]

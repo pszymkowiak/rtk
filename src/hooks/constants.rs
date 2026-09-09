@@ -18,11 +18,9 @@ pub const DROID_HOOK_COMMAND: &str = "rtk hook droid";
 pub const VIBE_HOOK_COMMAND: &str = "rtk hook vibe";
 /// Native Rust hook command for Codex CLI.
 pub const CODEX_HOOK_COMMAND: &str = "rtk hook codex";
-/// Codex's shell tool name, as observed in a live `PreToolUse` payload.
+/// Codex's shell tool, as reported by `tool_name` in a live `PreToolUse`
+/// payload, and therefore the `matcher` its handlers key off.
 pub const CODEX_SHELL_TOOL: &str = "Bash";
-/// Matcher for Codex's shell tool. Codex treats `matcher` as a regex and does
-/// NOT special-case a bare `"*"` — a hook registered with `"*"` never fires.
-pub const CODEX_SHELL_MATCHER: &str = "Bash";
 
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";
